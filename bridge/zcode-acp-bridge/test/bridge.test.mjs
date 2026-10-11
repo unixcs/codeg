@@ -34,14 +34,14 @@ test('--version 探针不挂 stdio', async () => {
   const out = await new Promise((resolve, reject) => {
     execFile('node', [bridgePath, '--version'], (e, stdout) => e ? reject(e) : resolve(stdout));
   });
-  assert.match(out, /zcode-acp-bridge 0\.2\.0/);
+  assert.match(out, /zcode-acp-bridge 0\.3\.0/);
 });
 
 test('initialize 应答 v1 能力与版本', async () => {
   await withBridge({}, async (b) => {
     const r = await initialize(b, 1);
     assert.equal(r.result.protocolVersion, 1);
-    assert.equal(r.result.agentInfo.version, '0.2.0');
+    assert.equal(r.result.agentInfo.version, '0.3.0');
     assert.equal(r.result.agentCapabilities.loadSession, true);
   });
 });
@@ -339,7 +339,8 @@ test('/compact：拦截 → zcode session/compact → in_progress/completed 卡�
     assert.equal(done._meta.contextCompaction.postTokens, 3000);
     const actions = await b.actions();
     const comp = actions.find(a => a.method === 'session/compact');
-    assert.deepEqual(comp.params, { sessionId: sid });
+    assert.equal(comp.params.sessionId, sid);
+    assert.match(comp.params.inputId, /^sess_mock_1\/\d+$/, 'compact carries precise-ownership inputId');
     // 不应直通 session/send
     assert.ok(!actions.some(a => a.method === 'session/send'), 'compact intercepted, no session/send');
   });

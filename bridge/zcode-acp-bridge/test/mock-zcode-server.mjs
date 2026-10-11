@@ -11,6 +11,9 @@
 //   MOCK_COMPACT_STICKY_PERMISSION=1  压缩 turn 发 permission.requested（测止损路径）
 //   MOCK_TURN_DELAY_MS=N              turn.completed 延迟
 //   MOCK_CREATE_DELAY_MS=N            session/create 延迟
+//   MOCK_RESUME_DELAY_MS=N            session/resume 延迟（测 respawn 并发/close 竞态窗口）
+//   MOCK_COMPACT_END_BEFORE_RESPONSE=1  already_running 时把在飞压缩的 turn.completed 先于响应写出
+//                                       （同 chunk 保序——复刻 R5-M1 竞态）
 //   MOCK_RESUME_MESSAGES_FILE         session/resume 返回的 messages（文件 JSON）
 //   MOCK_SESSION_ID                   自定义会话 id（默认 sess_mock_1）
 
@@ -48,6 +51,8 @@ const NOISE = process.env.MOCK_NOISE === '1';              // turn 流里夹未�
 const BARE_COMPLETED = process.env.MOCK_BARE_COMPLETED === '1'; // turn.completed 无 response 字段
 const TURN_DELAY = parseInt(process.env.MOCK_TURN_DELAY_MS || '15', 10);
 const CREATE_DELAY = parseInt(process.env.MOCK_CREATE_DELAY_MS || '0', 10);
+const RESUME_DELAY = parseInt(process.env.MOCK_RESUME_DELAY_MS || '0', 10);
+const COMPACT_END_FIRST = process.env.MOCK_COMPACT_END_BEFORE_RESPONSE === '1';
 const SID_PREFIX = process.env.MOCK_SESSION_ID || 'sess_mock_1';
 const SID_SEQ = process.env.MOCK_SESSION_ID_SEQ === '1'; // 1：每个 create 递增新 sessionId（并发会话场景）
 let sidCounter = 0;
@@ -71,8 +76,11 @@ function record(method, params) {
 function ev(type, payload, sid = lastSid) {
   send({ method: 'session/event', params: { type, payload, seq: ++seq, sessionId: sid, eventId: `e${seq}`, deliveryKind: 'desktop-continuous' } });
 }
-function runTurn(kind, sid = lastSid) {
-  ev('turn.started', { turnNumber: 1 }, sid);
+// 在飞压缩登记：accepted 后、终结事件前非空（真实 zcode 的 already_running 判据）
+let compactInFlight = null; // { sid, inputId, turn }
+function runTurn(kind, sid = lastSid, inputId) {
+  const turn = { ended: false };
+  ev('turn.started', { turnNumber: 1, ...(inputId ? { inputId } : {}) }, sid);
   if (NOISE) {
     ev('future.event.type', { something: true }, sid);   // 未来版本新词：桥必须忽略
     process.stdout.write('))) not json (((\n');           // 畸形行：桥必须跳过
@@ -83,11 +91,20 @@ function runTurn(kind, sid = lastSid) {
   }
   if (kind === 'compact' && STICKY_PERM) {
     ev('permission.requested', { requestId: 'perm_1', toolCallId: 't1', toolName: 'bash', reason: 'test', riskLevel: 'low', input: {}, options: [{ optionId: 'opt_allow', label: 'Allow', kind: 'allowOnce' }] }, sid);
-    return; // 收口交给 permission 应答后的 turn.completed
+    return turn; // 收口交给 permission 应答后的 turn.completed
   }
   if (kind !== 'compact') ev('part.delta', { messageId: 'm1', partId: 'p1', field: 'text', delta: 'echo:' }, sid);
-  const completed = BARE_COMPLETED ? {} : { response: kind === 'compact' ? 'compaction summary text' : 'echo:ok', tokenCount: 3, toolCallCount: 0, duration: 5 };
-  setTimeout(() => ev('turn.completed', completed, sid), TURN_DELAY);
+  const completed = {
+    ...(inputId ? { inputId } : {}),
+    ...(BARE_COMPLETED ? {} : { response: kind === 'compact' ? 'compaction summary text' : 'echo:ok', tokenCount: 3, toolCallCount: 0, duration: 5 }),
+  };
+  setTimeout(() => {
+    if (turn.ended) return; // 已被 END_FIRST 等路径提前收口
+    turn.ended = true;
+    ev('turn.completed', completed, sid);
+    if (compactInFlight && compactInFlight.turn === turn) compactInFlight = null;
+  }, TURN_DELAY);
+  return turn;
 }
 
 let buf = '';
@@ -155,24 +172,44 @@ function handle(m) {
     case 'session/send':
       if (p.sessionId !== lastSid) { send({ id: m.id, error: { code: -32602, message: 'unknown session' } }); return; }
       send({ id: m.id, result: { accepted: true, sessionId: p.sessionId, stateRevision: 1 } });
-      runTurn('prompt', p.sessionId);
+      runTurn('prompt', p.sessionId, p.inputId);
       return;
-    case 'session/compact':
+    case 'session/compact': {
       if (COMPACT_FAILS) { send({ id: m.id, error: { code: -32010, message: 'Cannot compact while a prompt is running' } }); return; }
+      if (compactInFlight && compactInFlight.sid === (p.sessionId || lastSid)) {
+        // 真实 zcode 语义：已在压缩中 → 不重复开 turn，回 already_running
+        if (COMPACT_END_FIRST) {
+          // R5-M1 竞态复刻：在飞压缩的终结事件先于本响应写出（stdout 保序 → 桥同 chunk 收到）
+          compactInFlight.turn.ended = true;
+          ev('turn.completed', { inputId: compactInFlight.inputId, response: 'in-flight compaction summary', duration: 4 }, compactInFlight.sid);
+          compactInFlight = null;
+        }
+        send({ id: m.id, result: { compact: { state: 'already_running', ...(p.inputId ? { inputId: p.inputId } : {}) } } });
+        return;
+      }
+      const compactInputId = p.inputId || `mock-compact-${++seq}`;
       send({ id: m.id, result: { response: '', snapshot: {}, compact: { state: 'started', ...(p.inputId ? { inputId: p.inputId } : {}) } } });
-      runTurn('compact', p.sessionId);
+      const turn = runTurn('compact', p.sessionId, compactInputId);
+      compactInFlight = { sid: p.sessionId || lastSid, inputId: compactInputId, turn };
       return;
+    }
     case 'session/stop':
       send({ id: m.id, result: {} });
       return;
     case 'session/resume':
       if (p.sessionId !== lastSid) { send({ id: m.id, error: { code: -32602, message: 'unknown session' } }); return; }
-      send({ id: m.id, result: { messages: resumeMessages, projection: {}, protocol: { name: 'ZCode Protocol', version: 1 }, runtime: {} } });
+      {
+        const done = () => send({ id: m.id, result: { messages: resumeMessages, projection: {}, protocol: { name: 'ZCode Protocol', version: 1 }, runtime: {} } });
+        if (RESUME_DELAY > 0) setTimeout(done, RESUME_DELAY); else done();
+      }
       return;
     case 'v4/command':
       send({ id: m.id, result: { type: p.type, resolvedBy: { clientId: 'mock' } } });
       // permission 应答后给压缩 turn 收口（sticky permission 场景）
-      if (p.type === 'resolveInteraction') setTimeout(() => ev('turn.completed', { response: '', duration: 3 }), TURN_DELAY);
+      if (p.type === 'resolveInteraction') setTimeout(() => {
+        ev('turn.completed', { response: '', duration: 3 }, lastSid);
+        if (compactInFlight) compactInFlight = null;
+      }, TURN_DELAY);
       return;
     default:
       send({ id: m.id, error: { code: -32601, message: `Method not found: ${m.method}` } });

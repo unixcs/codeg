@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // zcode-acp-bridge — ACP (Agent Client Protocol) agent ⇄ ZCode Protocol (zcode app-server --stdio) 适配器
-// v0.2.0。v0.1 是最小消息直通桥；v0.2 对齐 codeg 0.35.x 的 config option 机制并补齐 /compact。
+// v0.3.0。v0.1 是最小消息直通桥；v0.2 对齐 codeg 0.35.x 的 config option 机制并补齐 /compact；
+// v0.3 吸收两轮对抗审查的加固：inputId turn 精确归属、spawn 全局并发闸、跨 workspace 归属校验、
+// 看门狗补发 session/stop、日志 0600/redact 扩展、权限选项 kind 白名单、backlog/背压保险丝。
 //
 // v0.2 新增（对齐 codeg 的 config option 机制，零宿主改动）：
 //   1. 模型选择器：session/new 响应携带 configOptions（id="model" + category="model" 的 select，
@@ -13,6 +15,13 @@
 //   4. 模型清单三层合并：BRIDGE_MODELS（手动）∪ session/read available（实时）∪
 //      $BRIDGE_ZCODE_HOME/.zcode/v2/provider_config.json（zcode 配置全量，默认截 top:16）。
 //
+// v0.3 新增：
+//   5. turn 归属升级为 inputId 精确匹配（zcode 3.14+ 的 session/send|compact 接受 params.inputId
+//      并在 turn.started/completed/failed 中回显）；无 inputId 的旧 zcode 走原三重身份判定兜底。
+//      cancel/看门狗收掉的轮其 inputId 转 foreignInputIds 追踪，迟到终结用于 already_running 跟随收口。
+//   6. respawn 恢复宿主显式模式选择（explicitMode），不再强制切 yolo。
+//   7. 思考深度选项 category 改为 ACP 原生 "thought_level"（"model" 会被 codeg
+//      isModelConfigOption 误并入模型选择器分组）。
 // 用法（Codeg 自定义 agent / 其他 ACP 宿主的 agent 配置）：
 //   { "name": "zcode", "brief": "...", "command": "zcode-acp-bridge", "protocol": "acp", "args": [] }
 // 环境变量：
@@ -44,13 +53,13 @@
 // 始终发送 compaction_update（status ∈ in_progress|completed|failed，不用 cancelled）。
 
 import { spawn } from 'node:child_process';
-import { mkdirSync, appendFileSync, statSync, renameSync, readFileSync, existsSync, openSync, closeSync, mkdtempSync } from 'node:fs';
+import { mkdirSync, appendFileSync, statSync, renameSync, readFileSync, existsSync, openSync, closeSync, mkdtempSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 // 版本探测：ACP 宿主（Codeg 等）preflight 会跑 `agent --version`；不处理会挂在 stdio 等输入
 if (process.argv.some(a => a === '--version' || a === '-V' || a === '-v')) {
-  console.log('zcode-acp-bridge 0.2.0');
+  console.log('zcode-acp-bridge 0.3.0');
   process.exit(0);
 }
 
@@ -66,10 +75,15 @@ const CONFIG_OPTIONS_ON = (process.env.BRIDGE_CONFIG_OPTIONS || 'on').toLowerCas
 const COMPACT_ON = (process.env.BRIDGE_COMPACT || 'on').toLowerCase() !== 'off' && CONFIG_OPTIONS_ON;
 const THOUGHT_ON = (process.env.BRIDGE_THOUGHT_LEVEL || 'on').toLowerCase() !== 'off';
 const SEP = '\u241f'; // ␟ 单元分隔符：provider␟model[␟level]，拆分安全（两字段本身可含冒号）
-const TURN_WATCHDOG_MS = parseInt(process.env.BRIDGE_TURN_WATCHDOG_MS || '', 10) || 25 * 60 * 1000;
+// 数值型 env：非法/越界一律回默认并夹紧（负数会让 setTimeout 立即开火——每轮秒收/每分钟全杀）
+function parseMsEnv(raw, def, min) {
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n >= min ? n : def;
+}
+const TURN_WATCHDOG_MS = parseMsEnv(process.env.BRIDGE_TURN_WATCHDOG_MS, 25 * 60 * 1000, 5000);
 const PROMPT_MAX_CHARS = 2 * 1024 * 1024; // 宿主 prompt 总文本上限（防 OOM）
 const LINE_BUF_MAX = 16 * 1024 * 1024;    // 单行 NDJSON 缓冲上限
-const MAX_CONCURRENT_SPAWNS = 8;          // 并发建会话闸（每个 zcode 子进程 ~300MB）
+const MAX_CONCURRENT_SPAWNS = 8;          // 全局并发 zcode 子进程闸（每个 ~300MB；new/load/resume/respawn 全过闸）
 
 // BRIDGE_CONFIG_MODELS 解析：off | all | top:N（默认 16）
 const CONFIG_MODELS_RAW = (process.env.BRIDGE_CONFIG_MODELS || 'top:16').trim().toLowerCase();
@@ -77,7 +91,10 @@ const CONFIG_MODELS = CONFIG_MODELS_RAW === 'off' ? { mode: 'off' }
   : CONFIG_MODELS_RAW === 'all' ? { mode: 'all' }
   : /^top:\d+$/.test(CONFIG_MODELS_RAW) ? { mode: 'top', limit: Math.max(1, parseInt(CONFIG_MODELS_RAW.slice(4), 10)) }
   : null;
-const CONFIG_MODELS_EFF = CONFIG_MODELS || { mode: 'top', limit: 16 };
+const CONFIG_MODELS_EFF =
+  // v0.1 兼容档默认真正对齐 v0.1 的两层 models 块（config 层是 v0.2 新增），除非显式给了 BRIDGE_CONFIG_MODELS
+  (!CONFIG_OPTIONS_ON && process.env.BRIDGE_CONFIG_MODELS === undefined) ? { mode: 'off' }
+  : CONFIG_MODELS || { mode: 'top', limit: 16 };
 
 // "kimi-k3@low,cn:glm-5.3-flash@max" -> [{modelId:'kimi-k3', level:'low'}, ...]
 const ENV_MODELS = (process.env.BRIDGE_MODELS || '').split(',').map(x => x.trim()).filter(Boolean)
@@ -107,10 +124,17 @@ if (!LOG_DIR) {
 try { if (LOG_DIR) mkdirSync(LOG_DIR, { recursive: true, mode: 0o700 }); } catch {}
 const LOG_FILE = LOG_DIR ? join(LOG_DIR, `bridge-${process.pid}.log`) : '';
 try { if (LOG_FILE) closeSync(openSync(LOG_FILE, 'a', 0o600)); } catch {}
-// 落盘脱敏：密钥形态打码 + 单行化（防日志注入）
+// 落盘脱敏：密钥形态打码 + 单行化（防日志注入）。词表按"误伤优于漏报"取舍，覆盖：
+// OpenAI(sk-)/Bearer/Authorization、api_key 形态、query 里的 key/token、access/auth token、
+// AWS AKIA/ASIA、GitHub token(ghp_/gho_/ghu_/ghs_/ghr_)、JWT 三段式、cookie/secret/password。
 function redact(s) {
   return String(s)
-    .replace(/\b(sk-[A-Za-z0-9_-]{8,}|Bearer\s+\S+|api[_-]?key["'=:\s]+\S+|Authorization:\s*\S+)\s*/gi, '[redacted] ')
+    .replace(/\b(sk-[A-Za-z0-9_-]{8,}|Bearer\s+\S+|api[_-]?key["'=:\s]+\S+|Authorization:\s*\S+|Authorization\s+\S+)\s*/gi, '[redacted] ')
+    .replace(/[?&](key|token|access_token|api_key|apikey|sig|signature)=\S+/gi, '[redacted]')
+    .replace(/\b((access|auth|session|id|refresh)[_-]?token|secret|password|passwd|pwd|cookie)["'=:\s]+\S+/gi, '[redacted]')
+    .replace(/\b(AKIA|ASIA)[A-Z0-9]{16}\b/g, '[redacted]')
+    .replace(/\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, '[redacted]')
+    .replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}\b/g, '[redacted]')
     .replace(/\s*\n\s*/g, ' ⏎ ');
 }
 function log(...args) {
@@ -118,7 +142,10 @@ function log(...args) {
   try {
     // 单文件超 8MB 滚一份 .old，防小盘被长跑日志吃穿（回收型进程每会话一个，双文件封顶 ~16MB）
     try { if (statSync(LOG_FILE).size > 8 * 1024 * 1024) renameSync(LOG_FILE, LOG_FILE.replace(/\.log$/, '.old.log')); } catch {}
-    appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${args.map(a => typeof a === 'string' ? redact(a) : JSON.stringify(a)).join(' ')}\n`);
+    // 非字符串参数 stringify 后同样过 redact（对象字段值可能是密钥/正文片段）；0600 防轮转重建后权限漂移
+    const line = args.map(a => redact(typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+    try { appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${line}\n`, { mode: 0o600 }); }
+    catch { try { appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${line}\n`); chmodSync(LOG_FILE, 0o600); } catch {} }
   } catch {}
 }
 log('bridge start', { pid: process.pid, PERM_MODE, ZCODE_BIN, COMPACT_ON, THOUGHT_ON, CONFIG_MODELS_EFF });
@@ -129,6 +156,12 @@ if (PERM_MODE !== PERM_MODE_RAW) log('BRIDGE_PERMISSION_MODE invalid, using deny
 // 注意两侧不对称：ACP/JSON-RPC 侧带 "jsonrpc":"2.0"（Codeg Rust serde 可能强校验）；
 // zcode 侧（zcodeSend）绝不能带——zcode app-server 对含 jsonrpc 字段的行静默丢弃。
 function acpSend(msg) {
+  // 出向背压：宿主读停 + 长流式 turn 时 Node 流缓冲无界增长。超 8MB 只丢低价值 delta 帧，
+  // 语义帧（收口/卡片/工具终态）必达——丢 delta 只影响打字机效果，不影响最终内容
+  if (process.stdout.writableLength > 8 * 1024 * 1024) {
+    const su = msg.method === 'session/update' ? msg.params?.update?.sessionUpdate : '';
+    if (su === 'agent_message_chunk' || su === 'agent_thought_chunk') return;
+  }
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...msg }) + '\n');
 }
 
@@ -138,7 +171,19 @@ function acpSend(msg) {
 //   compaction, compactSeq, opQueue, stopReason, closed }
 const sessions = new Map();
 const allChildren = new Set(); // 全量子进程登记：会话条目被覆盖/删除后仍能收尸，防 ~300MB 孤儿
-let spawningCount = 0;         // 并发建会话闸计数（session/new）
+let spawningCount = 0;         // 全局并发 zcode 子进程闸（new/load/resume/respawn 全过闸）
+const sessionCwds = new Map(); // zsid → cwd 归属登记：load/resume 拒绝跨 workspace 挂会话（桥生命周期内有效）
+
+// 全局并发闸：zcode 子进程 ~300MB，宿主重连风暴/bug 循环失控 spawn 会直接 OOM 整机
+function acquireSpawnSlot() {
+  if (spawningCount >= MAX_CONCURRENT_SPAWNS) {
+    const err = new Error(`too many concurrent zcode spawns (${spawningCount}/${MAX_CONCURRENT_SPAWNS})`);
+    err.code = -32603;
+    throw err;
+  }
+  spawningCount++;
+}
+function releaseSpawnSlot() { spawningCount = Math.max(0, spawningCount - 1); }
 
 function assertCwd(cwd) {
   let st;
@@ -364,12 +409,17 @@ function handleZcodeNotification(m) {
       // MindFS 用会话 key 管理标题，标题变化不透传（无对应 ACP 通知）
       break;
 
-    case 'turn.started':
+    case 'turn.started': {
       s.fullTextLen = 0; // 新一轮：全文增量追踪归零
-      // 代际证据：当前 waiter（或刚写出的 send/compact）对应的 turn.started 已见到。
-      // 迟到终结事件（cancel 后旧轮补发）没有新轮的 started 陪伴 → 终结处理时被吞。
-      if (s.turnWaiter || s.pendingTurnOp) s.sawTurnStarted = true;
+      // 归属证据（zcode 3.14+ 事件回显 inputId）：精确匹配才作证，异源 started 不污染。
+      // 兜底（事件不带 inputId 的旧 zcode）：沿用"waiter/pendingTurnOp 在飞即作证"启发式。
+      if (p.inputId) {
+        if (s.activeInputId && p.inputId === s.activeInputId) s.sawTurnStarted = true;
+      } else if (s.turnWaiter || s.pendingTurnOp) {
+        s.sawTurnStarted = true;
+      }
       break;
+    }
 
     case 'part.delta': {
       const text = p.delta || '';
@@ -445,14 +495,21 @@ function handleZcodeNotification(m) {
       break;
 
     case 'permission.requested': {
-      // allow 档：yolo 生效时不应出现；出现（版本差异 yolo 不可用）则尽力自动批准，救不动就止损收口
+      // allow 档：yolo 生效时不应出现；出现（版本差异 yolo 不可用）则尽力自动批准，救不动就止损收口。
+      // 匹配优先 kind 白名单（zcode 约定 allow_once/allow_session/allow_always），词表只兜底且排除否定
+      // 语义（disallow/never approve 这类未来词条不能被 /allow|approve/ 误匹配成"批准"）。
+      const optTxt = (o) => String(o?.kind || o?.optionId || o?.name || '');
+      const optMeta = (p) => ({ toolName: p.toolName, riskLevel: p.riskLevel, options: (p.options || []).map(o => o.optionId || o.kind) }); // 只记元数据，不落 input/reason 正文
       if (PERM_MODE === 'allow' && p.requestId) {
-        // 优先非持久化的批准项（allow_once 类）；只有纯 allow 不存在时才退而求其次碰 always 类——
-        // 自动批准不该替用户留下永久授权
-        const optTxt = (o) => String(o?.kind || o?.optionId || o?.name || '');
         const opts = p.options || [];
-        const allowOpt = opts.find(o => /allow|approve|accept|proceed/i.test(optTxt(o)) && !/always|remember|persist/i.test(optTxt(o)))
-          || opts.find(o => /allow|approve|accept|proceed/i.test(optTxt(o)));
+        const noNeg = (o) => !/^(dis|never|not)[-_ ]/i.test(optTxt(o));
+        const allowOpt = opts.find(o => o.kind === 'allow_once')
+          || opts.find(o => o.kind === 'allow_session')
+          || opts.find(o => /allow|approve|accept|proceed/i.test(optTxt(o)) && !/always|remember|persist/i.test(optTxt(o)) && noNeg(o))
+          || opts.find(o => /allow|approve|accept|proceed/i.test(optTxt(o)) && noNeg(o));
+        if (allowOpt && /always|remember|persist/i.test(optTxt(allowOpt))) {
+          log('allow fallback hit a persistent option (word list drift?)', optMeta(p)); // 自动批准不该替用户留下永久授权，留痕
+        }
         if (allowOpt?.optionId && s.zc) {
           s.zc.request('v4/command', {
             sessionId: sid,
@@ -461,27 +518,29 @@ function handleZcodeNotification(m) {
           }).catch(e => log('allow resolveInteraction failed', String(e).slice(0, 150)));
         } else {
           // 不发猜测的 optionId：直接止损，别让这轮挂到 25min 看门狗
-          log('allow mode: no approvable option, stopping turn', JSON.stringify(p).slice(0, 150));
+          log('allow mode: no approvable option, stopping turn', optMeta(p));
           s.zc?.request('session/stop', { sessionId: sid }, 10000).catch(() => {});
           if (s.compaction) emitCompactionCard(s, 'failed', 'permission stuck during compaction');
           endTurn(s, 'refusal');
         }
       } else if (PERM_MODE === 'deny' && p.requestId) {
-        const denyOpt = (p.options || []).find(o => /deny|reject/i.test(o.kind || o.optionId || ''));
+        const opts = p.options || [];
+        const denyOpt = opts.find(o => o.kind === 'deny')
+          || opts.find(o => /deny|reject/i.test(optTxt(o)) && !/^(un|not|never)[-_ ]/i.test(optTxt(o)));
         if (denyOpt?.optionId && s.zc) {
           s.zc.request('v4/command', {
             sessionId: sid,
             type: 'resolveInteraction',
             payload: { resolveInteraction: { interactionId: p.requestId, answer: { optionId: denyOpt.optionId } } },
-          }).catch(e => log('deny resolveInteraction failed', String(e)));
+          }).catch(e => log('deny resolveInteraction failed', String(e).slice(0, 150)));
         } else {
-          log('deny mode: no matching option, stopping turn', JSON.stringify(p).slice(0, 150));
+          log('deny mode: no matching option, stopping turn', optMeta(p));
           s.zc?.request('session/stop', { sessionId: sid }, 10000).catch(() => {});
           if (s.compaction) emitCompactionCard(s, 'failed', 'denied during compaction');
           endTurn(s, 'refusal');
         }
       } else {
-        log('permission.requested unexpected', JSON.stringify(p).slice(0, 200));
+        log('permission.requested unexpected', optMeta(p));
       }
       break;
     }
@@ -496,13 +555,49 @@ function handleZcodeNotification(m) {
   }
 }
 
-// turn 终结统一收口。三重身份判定（zcode 事件不带 turn 归属 id，只能推断）：
-//   1. 无 waiter + 非 pendingTurnOp → 上一轮被 cancel/看门狗收口后的迟到事件：吞。
-//   2. 有 waiter 但没见过本轮 turn.started → cancel 后旧轮补发的终结：吞（修"迟到收口污染新轮"）。
-//   3. 无 waiter + pendingTurnOp（send/compact 已写出、请求响应与终结事件同 chunk）→
-//      waiter 尚未挂上：缓存终结，请求响应处理后立即重放（修"同 chunk 挂死 25min"）。
+// turn 终结统一收口。归属判定两级：
+//   精确（zcode 3.14+：send/compact 的 inputId 会被 turn 事件回显）——
+//     匹配 activeInputId → 本轮终结（pendingTurnOp 期间缓存，响应回来重放）；
+//     命中 foreignInputIds → 此前发起、未见到终结的轮（cancel/看门狗/退出后仍可能在飞）。
+//       已在飞等待（already_running 跟随）时直接用它收口；请求窗口内先缓存。
+//     其余 inputId → 无主事件：吞。
+//   兜底（旧 zcode 事件不带 inputId）——原三重身份判定：
+//     1. 无 waiter + 非 pendingTurnOp → 迟到事件：吞。
+//     2. 有 waiter 但没见过本轮 turn.started → 旧轮补发的终结：吞。
+//     3. 无 waiter + pendingTurnOp → waiter 尚未挂上：缓存终结，响应处理后立即重放。
 function handleTurnEnd(s, sid, type, p) {
   const kind = type === 'turn.failed' ? 'failed' : 'completed';
+  if (p && typeof p.inputId === 'string') {
+    if (p.inputId === s.activeInputId) {
+      if (s.pendingTurnOp) {
+        s.bufferedTurnEnd = { kind, p };
+        log('turn end buffered (same-chunk, response in flight)', kind, p.inputId);
+      } else if (s.turnWaiter) {
+        finishTurn(s, sid, kind, p);
+      } else {
+        log('turn end for already-finished op ignored', kind, p.inputId);
+      }
+      return;
+    }
+    if (s.foreignInputIds && s.foreignInputIds.has(p.inputId)) {
+      s.foreignInputIds.delete(p.inputId);
+      if (s.pendingTurnOp) {
+        s.bufferedForeignEnd = { kind, p };
+        log('foreign turn end buffered (response in flight)', kind, p.inputId);
+      } else if (s.turnWaiter && s.followForeign) {
+        // already_running 跟随：在飞压缩（我们早前发起）此刻终结——用它收口当前 prompt。
+        // followForeign 门控：不带门的 foreign 收口会让无关僵尸轮（如 cancel 后迟到的
+        // 旧 prompt 终结）误收新一轮的 waiter
+        log('foreign turn end finishing follower turn', kind, p.inputId);
+        finishTurn(s, sid, kind, p);
+      } else {
+        log('foreign turn end ignored (no waiter / not following)', kind, p.inputId);
+      }
+      return;
+    }
+    log('turn end with unknown inputId ignored', kind, p.inputId);
+    return;
+  }
   if (!s.turnWaiter) {
     if (s.pendingTurnOp && s.sawTurnStarted) {
       s.bufferedTurnEnd = { kind, p };
@@ -517,6 +612,7 @@ function handleTurnEnd(s, sid, type, p) {
 }
 
 function finishTurn(s, sid, kind, p) {
+  s.activeInputId = null; // 本轮终结已被见到：不进 foreign 追踪（endTurn 只收"未见终结"的 inputId）
   if (kind === 'failed') {
     const errMsg = p.error?.message || p.error?.detail || 'turn failed';
     if (s.compaction) {
@@ -545,6 +641,16 @@ function finishTurn(s, sid, kind, p) {
 }
 
 function endTurn(s, stopReason) {
+  // 收口时本轮终结事件未见（cancel/看门狗/进程退出/错误清理）：zcode 侧 turn 可能仍在飞
+  //（stop 是异步的）——inputId 转 foreign 追踪，其迟到终结供 already_running 跟随收口。
+  // 上限 8 个 FIFO：只关心最近的在飞轮，更老的终结事件本就该吞。
+  if (s.activeInputId) {
+    s.foreignInputIds.add(s.activeInputId);
+    while (s.foreignInputIds.size > 8) s.foreignInputIds.delete(s.foreignInputIds.values().next().value);
+    s.activeInputId = null;
+  }
+  s.bufferedForeignEnd = null; // 收口即过代：foreign 缓存随本轮作废
+  s.followForeign = false;     // 同理：跟随态不跨轮
   if (!s.turnWaiter) return;
   s.lastStopReason = stopReason;
   s.sawTurnStarted = false;   // 收口后代际证据作废：旧轮迟到的 started 不该替新轮作证
@@ -717,26 +823,33 @@ async function initZcodeSession(zc, cwd) {
 function newSessionState(zc, zsid, cwd, workspaceKey) {
   return {
     zc, zsid, cwd, workspaceKey,
-    models: [],            // v0.1 兼容层：session/new|load|resume 响应里的 models 块（旧宿主消费）
+    models: [],            // v0.1 兼容层：session/new|load|resume 响应里的 models 块（旧宿主消费；非 ACP schema 字段，MindFS 私有扩展）
     currentModelId: null,
     currentMode: 'build',
+    explicitMode: null,    // 宿主显式设过的模式（set_mode / set_config_option('mode')）；respawn 时优先恢复它而非强切 yolo
     providerId: 'new-provider',
     liveModels: [],        // session/read available 实时层
     thoughtLevels: null,   // { current, available:[{value,label}] } | null
     seenToolCalls: new Map(), partStarted: new Set(), turnWaiter: null,
-    sawTurnStarted: false,   // 代际证据：本轮 turn.started 是否已见（终结事件防伪）
+    sawTurnStarted: false,   // [兜底] 旧 zcode 事件不带 inputId 时的代际证据：本轮 turn.started 是否已见
     pendingTurnOp: false,    // send/compact 已写出但响应未处理（同 chunk 终结缓存判据）
     bufferedTurnEnd: null,   // 同 chunk 场景暂存的终结事件 { kind, p }
+    activeInputId: null,     // 当前在飞 turn op 的精确归属 id（session/send|compact 回传，turn 事件回显）
+    foreignInputIds: new Set(), // 曾发起但终结事件未见（cancel/看门狗/进程退出）的 inputId：其迟到终结用于 already_running 跟随
+    followForeign: false,    // already_running 跟随态：仅此时 foreign 终结才允许收当前 waiter（防无关僵尸轮误收口）
+    bufferedForeignEnd: null,   // pendingTurnOp 窗口内到达的 foreign 终结 { kind, p }（already_running 同 chunk 竞态）
+    cancelRequested: false,  // ensureZcode 重建窗口内收到 cancel：重建完成后本轮直接收口，不再开跑
     _respawn: null,          // ensureZcode 在飞重建 promise（并发去重）
     compaction: null, compactSeq: 0,
     opQueue: Promise.resolve(), // set_config_option 串行闸
+    opDepth: 0,              // 串行闸积压深度（防宿主洪泛 → 小时级排队）
     lastStopReason: 'end_turn',
     sawText: false, lastActivity: Date.now(), turnSeq: 0, busy: false, fullTextLen: 0, closed: false,
   };
 }
 
 // 闲置回收：zcode 子进程 ~300MB 常驻太贵；空闲 IDLE_MS 后杀掉，下次 prompt 走 session/resume 秒级重建
-const IDLE_MS = parseInt(process.env.BRIDGE_IDLE_EXIT_MS || '', 10) || 10 * 60 * 1000;
+const IDLE_MS = parseMsEnv(process.env.BRIDGE_IDLE_EXIT_MS, 10 * 60 * 1000, 60000);
 setInterval(() => {
   const now = Date.now();
   for (const s of sessions.values()) {
@@ -827,13 +940,15 @@ function buildConfigOptions(s) {
 
   const configOptions = [modelOption];
 
-  // 思考深度（zcode session/setThoughtLevel；available 来自 session/read）
+  // 思考深度（zcode session/setThoughtLevel；available 来自 session/read）。
+  // category 用 ACP 原生 "thought_level"：codeg 的 isModelConfigOption 按 id==="model" ||
+  // category==="model" 识别模型选择器，"model" 会把本选项误并入模型分组。
   if (THOUGHT_ON && s.thoughtLevels && s.thoughtLevels.available.length) {
     const tl = s.thoughtLevels;
     configOptions.push({
       id: 'reasoning_effort',
       name: '思考深度',
-      category: 'model',
+      category: 'thought_level',
       type: 'select',
       currentValue: tl.available.some(a => a.value === tl.current) ? tl.current : (tl.available[0]?.value || ''),
       options: tl.available.map(a => ({ value: a.value, name: a.label })),
@@ -852,7 +967,8 @@ function buildConfigOptions(s) {
   return configOptions;
 }
 
-// v0.1 兼容层：models 块（MindFS 消费；codeg 忽略）。编码 provider␟model[␟level]，env 层带 level。
+// v0.1 兼容层：models/modes 块是本桥的私有扩展（非 ACP schema——MindFS 消费；标准宿主如 codeg
+// 忽略不解析）。编码 provider␟model[␟level]，env 层带 level。
 function acpModelsBlock(s) {
   const entries = mergedModelEntries(s);
   const envSet = new Set(ENV_MODELS.map(m => m.modelId));
@@ -924,7 +1040,11 @@ async function finishResumedSession(zc, zsid, s) {
   // 与 initZcodeSession 相同的三层合并语义，保证恢复后的会话清单一致
   s.models = acpModelsBlock(s).availableModels;
   if (PERM_MODE === 'allow') {
-    try { await zc.request('session/setMode', { sessionId: zsid, mode: 'yolo' }, 10000); s.currentMode = 'yolo'; } catch {}
+    // 宿主显式设过模式（set_mode / set_config_option('mode')）→ 恢复它；否则 allow 档默认 yolo。
+    // 盲目强切 yolo 会静默覆盖 plan 的只读约束，且 respawn 对宿主不可见（codeg 偏好回放只在
+    // attach 时执行一次），UI/zcode/桥三方漂移。
+    const target = s.explicitMode && ZCODE_MODES.some(m => m.id === s.explicitMode) ? s.explicitMode : 'yolo';
+    try { await zc.request('session/setMode', { sessionId: zsid, mode: target }, 10000); s.currentMode = target; } catch {}
   }
   await zc.request('session/subscribe', { sessionId: zsid, deliveryKind: 'desktop-continuous' }, 15000); // 失败随 load/resume 一起报给宿主
 }
@@ -939,14 +1059,21 @@ async function ensureZcode(s) {
   if (s._respawn) return s._respawn;
   s._respawn = (async () => {
     log('respawning zcode child', s.zsid);
+    acquireSpawnSlot();
     const zc = spawnZcode(s.cwd);
     try {
       await zc.request('session/resume', { sessionId: s.zsid, workspace: { workspacePath: s.cwd, workspaceKey: s.workspaceKey } }, 45000);
+      // close 撞 respawn：respawn 期间 s.zc 为 null、close 的 kill 落空——不查 closed 就把
+      // ~300MB 子进程挂回已删除的会话对象，回收器再也够不到（孤儿 + 上下文泄漏）
+      if (s.closed) { zc.kill(); throw new Error('session closed during respawn'); }
       s.zc = zc;
       s.lastActivity = Date.now();
       await finishResumedSession(zc, s.zsid, s);
+      if (s.closed) { zc.kill(); throw new Error('session closed during respawn'); }
+      pushConfigOptions(s); // respawn 对宿主不可见（无偏好回放）：重推一次让选择器与实际状态对齐
       return zc;
     } catch (e) { zc.kill(); throw e; } // resume 失败/超时也杀子进程，防泄漏
+    finally { releaseSpawnSlot(); }
   })().finally(() => { s._respawn = null; });
   return s._respawn;
 }
@@ -990,6 +1117,7 @@ async function applyConfigOption(s, zc, configId, value) {
     if (!mode) throw new Error(`unsupported mode: ${value}`);
     await zc.request('session/setMode', { sessionId: s.zsid, mode }, 15000);
     s.currentMode = mode;
+    s.explicitMode = mode; // respawn 时恢复宿主的显式选择，而非强切 yolo
     return;
   }
   const err = new Error(`unknown config option: ${configId}`);
@@ -1013,7 +1141,7 @@ async function handleAcpRequest(id, method, params) {
             promptCapabilities: { audio: false, embeddedContext: false, image: false },
             sessionCapabilities: { close: {}, resume: {} },
           },
-          agentInfo: { name: 'zcode-acp-bridge', version: '0.2.0' },
+          agentInfo: { name: 'zcode-acp-bridge', version: '0.3.0' },
           authMethods: [],
         };
         break;
@@ -1021,18 +1149,13 @@ async function handleAcpRequest(id, method, params) {
       case 'session/new': {
         const cwd = params?.cwd || process.cwd();
         assertCwd(cwd);
-        // 并发闸：每个 zcode 子进程 ~300MB，宿主失控时拒绝而不是无限 spawn
-        if (spawningCount >= MAX_CONCURRENT_SPAWNS) {
-          const err = new Error(`too many concurrent session initializations (${spawningCount})`);
-          err.code = -32603;
-          throw err;
-        }
-        spawningCount++;
+        acquireSpawnSlot(); // 每个会话一个 zcode 子进程 ~300MB：new/load/resume/respawn 全局过闸
         let s;
-        try { s = await createZcodeSession(cwd); } finally { spawningCount--; }
+        try { s = await createZcodeSession(cwd); } finally { releaseSpawnSlot(); }
         const prev = sessions.get(s.zsid); // 理论上 zcode 不会复用 sessionId；真发生时收掉旧子进程防孤儿
         if (prev) prev.zc?.kill();
         sessions.set(s.zsid, s);
+        sessionCwds.set(s.zsid, cwd);
         // 预响应推送可用（宿主 runtime 对带 sessionId 的未认领通知暂存重放）；命令无 set 语义，安全
         pushAdvertisedCommands(s.zsid);
         // 建立期 configOptions 走响应内嵌（宿主按此做偏好回放，顺序安全）；v0.1 兼容档整个不发——
@@ -1047,9 +1170,22 @@ async function handleAcpRequest(id, method, params) {
         const zsid = params?.sessionId;
         if (!zsid) throw new Error('session/load: missing sessionId');
         assertCwd(cwd);
+        // 归属校验：zcode 侧 resume 只按 sessionId 取会话、不比对 workspace——桥必须自己挡
+        // "把别的 cwd 的会话挂进当前 workspace"（历史回放会泄漏到错误的 UI，新 turn 换了工作目录）
+        const knownCwd = sessionCwds.get(zsid);
+        if (knownCwd && knownCwd !== cwd) {
+          const err = new Error(`session ${zsid} belongs to another workspace`);
+          err.code = -32602;
+          throw err;
+        }
         // 重复 load（UI 重连等）：复用条目不重复 spawn，但历史要重新回放（宿主重连后 UI 是空的）
         if (sessions.has(zsid)) {
           const s0 = sessions.get(zsid);
+          if (s0.cwd !== cwd) {
+            const err = new Error(`session ${zsid} belongs to another workspace (${s0.cwd})`);
+            err.code = -32602;
+            throw err;
+          }
           const zc0 = await ensureZcode(s0);
           const rr0 = await zc0.request('session/resume', { sessionId: zsid }, 20000);
           replayHistory(s0, zsid, rr0.result?.messages || []);
@@ -1058,6 +1194,7 @@ async function handleAcpRequest(id, method, params) {
           postResponse.push(() => pushConfigOptions(s0));
           break;
         }
+        acquireSpawnSlot();
         const zc = spawnZcode(cwd);
         try {
           const rr = await zc.request('session/resume', { sessionId: zsid, workspace: { workspacePath: cwd, workspaceKey: workspaceKeyOf(cwd) } }, 45000);
@@ -1065,10 +1202,12 @@ async function handleAcpRequest(id, method, params) {
           replayHistory(s, zsid, rr.result?.messages || []);
           await finishResumedSession(zc, zsid, s);
           sessions.set(zsid, s);
+          sessionCwds.set(zsid, cwd);
+          releaseSpawnSlot(); // 条目已入册：闲置回收器接管子进程生命周期
           result = { models: acpModelsBlock(s), modes: acpModesBlock(s) };
           pushAdvertisedCommands(zsid);
           postResponse.push(() => pushConfigOptions(s)); // load 无建立期偏好回放通道：响应后重推（无 set 语义竞态）
-        } catch (e) { zc.kill(); throw e; } // resume/回放失败/超时也杀子进程，防泄漏
+        } catch (e) { zc.kill(); releaseSpawnSlot(); throw e; } // resume/回放失败/超时也杀子进程，防泄漏
         break;
       }
 
@@ -1078,24 +1217,38 @@ async function handleAcpRequest(id, method, params) {
         const zsid = params?.sessionId;
         if (!zsid) throw new Error('session/resume: missing sessionId');
         assertCwd(cwd);
+        const knownCwd = sessionCwds.get(zsid);
+        if (knownCwd && knownCwd !== cwd) {
+          const err = new Error(`session ${zsid} belongs to another workspace`);
+          err.code = -32602;
+          throw err;
+        }
         if (sessions.has(zsid)) {
           const s0 = sessions.get(zsid);
+          if (s0.cwd !== cwd) {
+            const err = new Error(`session ${zsid} belongs to another workspace (${s0.cwd})`);
+            err.code = -32602;
+            throw err;
+          }
           const zc0 = await ensureZcode(s0);
           await finishResumedSession(zc0, zsid, s0);
           result = { models: acpModelsBlock(s0), modes: acpModesBlock(s0) };
           postResponse.push(() => pushConfigOptions(s0));
           break;
         }
+        acquireSpawnSlot();
         const zc = spawnZcode(cwd);
         try {
           const rr = await zc.request('session/resume', { sessionId: zsid, workspace: { workspacePath: cwd, workspaceKey: workspaceKeyOf(cwd) } }, 45000);
           const s = newSessionState(zc, zsid, cwd, workspaceKeyOf(cwd));
           await finishResumedSession(zc, zsid, s);
           sessions.set(zsid, s);
+          sessionCwds.set(zsid, cwd);
+          releaseSpawnSlot();
           result = { models: acpModelsBlock(s), modes: acpModesBlock(s) };
           pushAdvertisedCommands(zsid);
           postResponse.push(() => pushConfigOptions(s));
-        } catch (e) { zc.kill(); throw e; } // resume 失败/超时也杀子进程，防泄漏
+        } catch (e) { zc.kill(); releaseSpawnSlot(); throw e; } // resume 失败/超时也杀子进程，防泄漏
         break;
       }
 
@@ -1113,9 +1266,16 @@ async function handleAcpRequest(id, method, params) {
           try {
             s.lastActivity = Date.now();
             const zc = await ensureZcode(s);
+            if (s.cancelRequested) { // 同 prompt：重建窗口内的 cancel 直接收口
+              s.cancelRequested = false;
+              result = { stopReason: 'cancelled' };
+              break;
+            }
             const myTurn = ++s.turnSeq;
+            const inputId = `${s.zsid}/${myTurn}`; // 精确归属：already_running 跟随时靠它认领在飞压缩的终结
+            s.activeInputId = inputId;
             const instructions = (compactMatch[1] || '').trim();
-            const cparams = { sessionId: s.zsid };
+            const cparams = { sessionId: s.zsid, inputId };
             if (instructions) cparams.instructions = instructions;
             // 时序三连（缺一不可）：
             //   compaction 态先置 —— part.upserted(compaction) 与请求响应同 chunk 时回调先于本协程恢复；
@@ -1129,6 +1289,8 @@ async function handleAcpRequest(id, method, params) {
               s.turnWaiter.timer = setTimeout(() => {
                 if (s.turnWaiter?.turn === myTurn) {
                   log('compact watchdog fired');
+                  // 同 prompt 看门狗：僵尸压缩 turn 占住会话，后续 send/compact 全被 -32010 拒
+                  s.zc?.request('session/stop', { sessionId: s.zsid }, 10000).catch(() => {});
                   if (s.compaction) emitCompactionCard(s, 'failed', 'compaction watchdog timeout');
                   endTurn(s, 'end_turn');
                 }
@@ -1148,10 +1310,16 @@ async function handleAcpRequest(id, method, params) {
             // 但 turn.started/completed 照常广播，waiter 继续等后台那轮收口
             const cstate = rrCompact?.result?.state || rrCompact?.result?.compact?.state;
             if (cstate === 'already_running') {
+              // 已在压缩中：跟随模式——保留 compaction 态并补发 in_progress 卡，本 turn 由
+              // 在飞那轮压缩的终结事件收口（其 inputId 早随 cancel/看门狗转入 foreignInputIds，
+              // 终结到达时走 foreign 分支 finishTurn → 照常发 completed/failed 卡）。
+              // 旧实现（compaction=null + 代际手工作证）会让这轮收口后宿主看到一条永远悬着的卡。
               log('compact already running, following its turn');
-              s.compaction = null;
-              // 在飞压缩的 turn.started 早已过去（先于本 waiter）——代际证据手动作证，
-              // 否则它的 turn.completed 会被判 stale，本 prompt 挂到看门狗
+              s.followForeign = true; // 跟随态：在飞压缩的 foreign 终结获准收当前 waiter
+              if (s.turnWaiter && !s.compaction.inProgressSent) emitCompactionCard(s, 'in_progress');
+              // 旧 zcode（终结事件不带 inputId）兜底：在飞压缩的 turn.started 早已过去（先于本
+              // waiter）——代际证据手工作证，否则它的 turn.completed 会被三重身份判定吞掉，
+              // 本 prompt 挂到看门狗。新 zcode 终结带 inputId 走精确归属，此行对它无效果。
               s.sawTurnStarted = true;
               notifySessionUpdate(s.zsid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '[zcode] 压缩已在进行中，等待其完成' } });
             } else if (s.turnWaiter && !s.compaction.inProgressSent) {
@@ -1160,8 +1328,14 @@ async function handleAcpRequest(id, method, params) {
             }
             // 同 chunk 情形：终结事件先于本协程恢复到达，已缓存——现在 waiter 已挂，立即重放
             if (s.bufferedTurnEnd) { const b = s.bufferedTurnEnd; s.bufferedTurnEnd = null; finishTurn(s, s.zsid, b.kind, b.p); }
+            // already_running 同 chunk 的另一形态：在飞压缩（foreign inputId）的终结先于响应到达，
+            // 已缓存到 bufferedForeignEnd——响应处理完后重放收口
+            if (cstate === 'already_running' && s.bufferedForeignEnd && s.turnWaiter) {
+              const b = s.bufferedForeignEnd; s.bufferedForeignEnd = null;
+              finishTurn(s, s.zsid, b.kind, b.p);
+            }
             result = { stopReason: (await done).stopReason || 'end_turn' };
-          } finally { s.busy = false; s.compaction = null; }
+          } finally { s.busy = false; s.compaction = null; s.cancelRequested = false; s.followForeign = false; }
           break;
         }
         const text = textBlocks.map(b => b.text).join('\n');
@@ -1177,19 +1351,34 @@ async function handleAcpRequest(id, method, params) {
         try {
           s.lastActivity = Date.now(); // 先记活跃再重建，防回收器在 ensureZcode 窗口开杀
           const zc = await ensureZcode(s); // 子进程可能已被闲置回收：透明重建
+          if (s.cancelRequested) {
+            // cancel 落在重建窗口内（ensureZcode 在飞时到达）：按 ACP 语义直接 cancelled 收口，
+            // 重建出的子进程不再开新 turn
+            s.cancelRequested = false;
+            result = { stopReason: 'cancelled' };
+            break;
+          }
           const myTurn = ++s.turnSeq; // 代际令牌：看门狗只认自己这轮
+          const inputId = `${s.zsid}/${myTurn}`; // 精确归属：zcode 3.14+ 在 turn 事件中回显
+          s.activeInputId = inputId;
           // waiter 先挂再写 send：zcode 把响应与终结事件合并进同一 chunk 时，事件回调先于
           // 本协程恢复执行——waiter 后挂的话终结事件会被判 stale，prompt 挂到看门狗
           const done = new Promise((resolve) => {
             s.turnWaiter = { resolve, turn: myTurn };
             s.sawTurnStarted = false; s.bufferedTurnEnd = null;
             s.turnWaiter.timer = setTimeout(() => {
-              if (s.turnWaiter?.turn === myTurn) { log('turn watchdog fired'); endTurn(s, 'end_turn'); }
+              if (s.turnWaiter?.turn === myTurn) {
+                log('turn watchdog fired');
+                // zcode 侧 turn 可能仍在跑：发 stop 杀掉，否则僵尸 turn 占住会话，
+                // 后续 session/send 全被 -32010（prompt already running）拒绝
+                s.zc?.request('session/stop', { sessionId: s.zsid }, 10000).catch(() => {});
+                endTurn(s, 'end_turn');
+              }
             }, TURN_WATCHDOG_MS);
           });
           s.pendingTurnOp = true;
           try {
-            await zc.request('session/send', { sessionId: s.zsid, content: text }, 30000);
+            await zc.request('session/send', { sessionId: s.zsid, content: text, inputId }, 30000);
           } catch (e) {
             s.pendingTurnOp = false;
             endTurn(s, 'end_turn'); // 释放 waiter/看门狗；turn 可能已在 zcode 侧开跑，事件成了 stale
@@ -1199,7 +1388,7 @@ async function handleAcpRequest(id, method, params) {
           if (s.bufferedTurnEnd) { const b = s.bufferedTurnEnd; s.bufferedTurnEnd = null; finishTurn(s, s.zsid, b.kind, b.p); }
           // send 前被 cancel 收走的轮次：done 已 resolve cancelled，直接透传
           result = { stopReason: (await done).stopReason || 'end_turn' };
-        } finally { s.busy = false; }
+        } finally { s.busy = false; s.cancelRequested = false; }
         break;
       }
 
@@ -1211,6 +1400,7 @@ async function handleAcpRequest(id, method, params) {
         const zc = await ensureZcode(s);
         await zc.request('session/setMode', { sessionId: s.zsid, mode }, 15000);
         s.currentMode = mode;
+        s.explicitMode = mode; // respawn 时恢复宿主的显式选择，而非强切 yolo
         result = {};
         break;
       }
@@ -1262,9 +1452,18 @@ async function handleAcpRequest(id, method, params) {
         }
         // 串行闸：模型/思考深度连切时按到达顺序落盘，避免两笔 setModel/setThoughtLevel 交错。
         // ensureZcode 放闸内：排队期间子进程可能死亡重建，闸外取的 zc 会写进虚空
+        if (s.opDepth >= 32) {
+          // 积压深度闸：宿主洪泛式连发会小时级排队（每笔都可能触发子进程重建）——直接拒绝
+          const err = new Error('config option backlog too deep');
+          err.code = -32603;
+          throw err;
+        }
+        s.opDepth++;
         const run = s.opQueue.then(async () => {
-          const zc2 = await ensureZcode(s);
-          return applyConfigOption(s, zc2, configId, value);
+          try {
+            const zc2 = await ensureZcode(s);
+            return await applyConfigOption(s, zc2, configId, value);
+          } finally { s.opDepth--; }
         });
         s.opQueue = run.catch(() => {});
         await run;
@@ -1322,7 +1521,11 @@ process.stdin.on('data', (d) => {
       if (m.method === 'session/cancel') {
         const s = sessions.get(m.params?.sessionId);
         if (s) {
-          // ACP 语义：被取消的 prompt 要尽快以 cancelled 收口（zcode 侧 stop 照发；子进程可能已被回收）
+          // ACP 语义：被取消的 prompt 要尽快以 cancelled 收口（zcode 侧 stop 照发；子进程可能已被回收）。
+          // cancelRequested 只标"send/compact 尚未写出"的窗口（busy 且无 waiter/pendingOp——典型是
+          // ensureZcode 重建在飞）：prompt/compact 协程重建完成后据此直接收口。turn 已在跑时置位
+          // 会泄漏到下一轮 prompt（误杀），故条件置位。
+          s.cancelRequested = s.busy && !s.turnWaiter && !s.pendingTurnOp;
           if (s.zc) s.zc.request('session/stop', { sessionId: s.zsid }, 10000).catch(e => log('cancel/stop failed', String(e)));
           // failed 卡只在 in_progress 卡已发过后补发，避免"failed 抢跑 in_progress"的时序倒挂
           if (s.compaction && s.compaction.inProgressSent) emitCompactionCard(s, 'failed', 'cancelled by user');

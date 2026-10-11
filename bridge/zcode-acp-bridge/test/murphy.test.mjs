@@ -3,7 +3,12 @@
 // 未知事件噪声、残缺 turn payload、SEP 注入、stdin 收尾。凡是"用户一定会踩"的都算。
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { startBridge, initialize } from './harness.mjs';
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 const SEP = '\u241f';
 
@@ -183,4 +188,108 @@ test('宿主 stdin end：桥自行退出且不留子进程', async () => {
   } finally {
     await b.close();
   }
+});
+
+// ---- R5/R6 吸收批：inputId 归属 / already_running 跟随 / 重建窗口 / spawn 闸 / 孤儿收尸 ----
+
+test('already_running 竞态（终结先于响应）：跟随轮快速收口 + 三态卡', async () => {
+  // R5-M1 复刻：第 1 次 /compact 被 cancel（inputId 转 foreign），在飞压缩继续；
+  // 第 2 次 /compact 撞上 already_running 且在飞轮的终结先于响应到达（同 chunk 保序）——
+  // 跟随模式必须快速收口并补齐 in_progress/completed 卡，而不是挂到看门狗
+  await withBridge({
+    env: { MOCK_TURN_DELAY_MS: 1500, MOCK_COMPACT_END_BEFORE_RESPONSE: '1' },
+  }, async (b) => {
+    await initialize(b, 1);
+    b.request(2, 'session/new', { cwd: '/tmp' });
+    const sid = (await b.responseFor(2)).result.sessionId;
+    b.request(3, 'session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '/compact' }] });
+    await b.waitFor(m => m.method === 'session/update' && m.params?.update?.sessionUpdate === 'compaction_update' && m.params?.update?.status === 'in_progress', 5000, 'first compact in_progress');
+    b.notify('session/cancel', { sessionId: sid });
+    assert.equal((await b.responseFor(3)).result.stopReason, 'cancelled');
+    const t0 = Date.now();
+    b.request(4, 'session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '/compact again' }] });
+    const r4 = await b.responseFor(4, 10000);
+    assert.ok(Date.now() - t0 < 8000, `follow-mode compact resolved fast (took ${Date.now() - t0}ms)`);
+    assert.equal(r4.result.stopReason, 'end_turn');
+    const cards = b.stdout.filter(m => m.method === 'session/update' && m.params?.update?.sessionUpdate === 'compaction_update').map(m => m.params.update.status);
+    assert.ok(cards.includes('in_progress') && cards.includes('completed'), `three-state cards present: ${cards.join(',')}`);
+    // 跟随轮收口靠在飞轮的终结事件（inputId 精确归属），session/compact 发了两次
+    const compacts = (await b.actions()).filter(a => a.method === 'session/compact');
+    assert.equal(compacts.length, 2);
+    assert.notEqual(compacts[0].params.inputId, compacts[1].params.inputId, 'distinct inputIds per op');
+  });
+});
+
+test('cancel 落在 respawn 重建窗口：本轮 cancelled 收口且不开新 turn', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zab-murphy-'));
+  const pidFile = join(dir, 'mock.pid');
+  await withBridge({ env: { MOCK_RESUME_DELAY_MS: 600, MOCK_PID_FILE: pidFile } }, async (b) => {
+    await initialize(b, 1);
+    b.request(2, 'session/new', { cwd: '/tmp' });
+    const sid = (await b.responseFor(2)).result.sessionId;
+    // 杀掉 zcode 子进程 → 桥的 exit 处理置空 s.zc；下一轮 prompt 走透明 respawn（resume 拖 600ms）
+    const pid1 = parseInt(readFileSync(pidFile, 'utf8'), 10);
+    process.kill(pid1, 'SIGKILL');
+    await sleep(400); // 等 exit 事件被桥消化
+    b.request(3, 'session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'cancelled mid-rebuild' }] });
+    b.notify('session/cancel', { sessionId: sid }); // 落在 respawn 窗口内
+    const r3 = await b.responseFor(3);
+    assert.equal(r3.result.stopReason, 'cancelled');
+    // 重建出的子进程没开新 turn：actions 里只有 resume/subscribe 等，无 session/send
+    assert.ok(!(await b.actions()).some(a => a.method === 'session/send'), 'no turn started after cancelled rebuild');
+    // 下一轮 prompt 正常（标记已消费、不误杀）
+    b.request(4, 'session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'next' }] });
+    assert.equal((await b.responseFor(4)).result.stopReason, 'end_turn');
+  });
+});
+
+test('close×respawn 竞态：close 后重建的子进程被杀，不留孤儿', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zab-murphy-'));
+  const pidFile = join(dir, 'mock.pid');
+  const b = await startBridge({ env: { MOCK_RESUME_DELAY_MS: 600, MOCK_PID_FILE: pidFile } });
+  try {
+    await initialize(b, 1);
+    b.request(2, 'session/new', { cwd: '/tmp' });
+    const sid = (await b.responseFor(2)).result.sessionId;
+    const pid1 = parseInt(readFileSync(pidFile, 'utf8'), 10);
+    process.kill(pid1, 'SIGKILL');
+    await sleep(400);
+    // prompt 触发 respawn（新 mock 立即 spawn 并覆写 pid 文件，resume 拖 600ms）；
+    // close 在 resume 在飞时到达 → ensureZcode 的 closed 检查必须杀掉新子进程
+    b.request(3, 'session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'doomed' }] });
+    b.request(4, 'session/close', { sessionId: sid });
+    const r4 = await b.responseFor(4);
+    assert.ok(r4.result, 'close acknowledged');
+    const r3 = await b.responseFor(3);
+    assert.ok(r3.error, 'in-flight prompt fails once session closed');
+    await sleep(500);
+    const pid2 = parseInt(readFileSync(pidFile, 'utf8'), 10);
+    assert.notEqual(pid2, pid1, 'respawned child registered its pid');
+    let alive = true;
+    try { process.kill(pid2, 0); } catch { alive = false; }
+    assert.ok(!alive, `respawned child ${pid2} reaped after close`);
+    // 桥还活着
+    b.request(5, 'session/new', { cwd: '/tmp' });
+    assert.ok((await b.responseFor(5)).result.sessionId, 'bridge alive after close');
+  } finally {
+    await b.close();
+  }
+});
+
+test('spawn 并发闸：12 并发 session/new → 8 成功 + 4 拒绝(-32603)', async () => {
+  await withBridge({ env: { MOCK_CREATE_DELAY_MS: 400, MOCK_SESSION_ID_SEQ: '1' } }, async (b) => {
+    await initialize(b, 1);
+    const ids = Array.from({ length: 12 }, (_, i) => 10 + i);
+    for (const id of ids) b.request(id, 'session/new', { cwd: '/tmp' });
+    const rs = await Promise.all(ids.map(id => b.responseFor(id, 15000)));
+    const ok = rs.filter(r => r.result?.sessionId);
+    const rejected = rs.filter(r => r.error);
+    assert.equal(ok.length, 8, `gate admits exactly 8: got ${ok.length}`);
+    assert.equal(rejected.length, 4, `gate rejects the rest: got ${rejected.length}`);
+    for (const r of rejected) {
+      assert.equal(r.error.code, -32603);
+      assert.match(r.error.message, /too many concurrent zcode spawns/);
+    }
+    assert.equal(new Set(ok.map(r => r.result.sessionId)).size, 8, 'distinct session ids');
+  });
 });
