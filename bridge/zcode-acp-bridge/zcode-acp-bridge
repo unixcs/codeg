@@ -25,6 +25,10 @@
 //                              （格式 modelId[@reasoningLevel]；provider 取会话当前 provider。排最前。）
 //   BRIDGE_DEFAULT_MODEL     = 会话建立时默认切到的模型（格式同上；缺省取 BRIDGE_MODELS 第一项）
 //   BRIDGE_CONFIG_MODELS     = 配置层清单开关/截断："top:N"（默认 top:16）| "all" | "off"
+//                              （多 provider 实例建议 "all"，全局截断会挤掉 providerOrder 靠后的组）
+//   BRIDGE_CONFIG_OPTIONS    = on（默认）| off —— off 即 v0.1 兼容档：不发任何 configOptions
+//                              （响应内嵌与推送都不发），模式走 modes/set_mode、模型走 models/set_model
+//                              通道，并隐含 BRIDGE_COMPACT=off（老宿主一键回退 v0.1 语义）
 //   BRIDGE_COMPACT           = on（默认）| off —— 是否宣告并接管 /compact
 //   BRIDGE_THOUGHT_LEVEL     = on（默认）| off —— 是否暴露思考深度选择器
 //   BRIDGE_LOG_DIR           = 日志目录（缺省 mkdtemp 到系统临时目录，0700；显式指定时由操作员负责权限）
@@ -55,7 +59,11 @@ const PERM_MODE = PERM_MODE_RAW === 'allow' ? 'allow' : PERM_MODE_RAW === 'deny'
 const ZCODE_BIN = process.env.BRIDGE_ZCODE_BIN || 'zcode';
 const ZCODE_HOME = process.env.BRIDGE_ZCODE_HOME || undefined;
 const LOG_DIR_EXPLICIT = process.env.BRIDGE_LOG_DIR || undefined;
-const COMPACT_ON = (process.env.BRIDGE_COMPACT || 'on').toLowerCase() !== 'off';
+// BRIDGE_CONFIG_OPTIONS=off：v0.1 兼容档（MindFS 等老宿主一键回退）——
+// 不发任何 configOptions（内嵌与推送），模式选择回 modes/set_mode 通道，
+// 隐含 BRIDGE_COMPACT=off（available_commands_update 与 compaction_update 都是 v0.1 后新增的通知类型）
+const CONFIG_OPTIONS_ON = (process.env.BRIDGE_CONFIG_OPTIONS || 'on').toLowerCase() !== 'off';
+const COMPACT_ON = (process.env.BRIDGE_COMPACT || 'on').toLowerCase() !== 'off' && CONFIG_OPTIONS_ON;
 const THOUGHT_ON = (process.env.BRIDGE_THOUGHT_LEVEL || 'on').toLowerCase() !== 'off';
 const SEP = '\u241f'; // ␟ 单元分隔符：provider␟model[␟level]，拆分安全（两字段本身可含冒号）
 const TURN_WATCHDOG_MS = parseInt(process.env.BRIDGE_TURN_WATCHDOG_MS || '', 10) || 25 * 60 * 1000;
@@ -173,11 +181,16 @@ function readZcodeProviderConfig() {
       const pid = rule?.providerId;
       if (!pid || typeof pid !== 'string') continue;
       const c = rule.config || {};
+      // 对齐 zcode resolveOwnedOrder 全序语义：[未列入 order 的 builtin] + [order 命中项] + [未列入 order 的 personal]
+      const order = Array.isArray(c.modelOrder) ? c.modelOrder.filter(x => typeof x === 'string' && x) : [];
+      const personal = Array.isArray(c.personalModelIds) ? c.personalModelIds.filter(x => typeof x === 'string' && x) : [];
+      const builtin = Array.isArray(c.builtinModelIds) ? c.builtinModelIds.filter(x => typeof x === 'string' && x) : [];
+      const owned = new Set([...personal, ...builtin]);
       const ordered = [];
-      const push = (arr) => { if (Array.isArray(arr)) for (const mid of arr) if (typeof mid === 'string' && mid && !ordered.includes(mid)) ordered.push(mid); };
-      push(c.modelOrder);
-      push(c.personalModelIds);
-      push(c.builtinModelIds);
+      const push = (mid) => { if (mid && !ordered.includes(mid)) ordered.push(mid); };
+      for (const mid of builtin) if (!order.includes(mid)) push(mid);
+      for (const mid of order) if (owned.has(mid)) push(mid);
+      for (const mid of personal) if (!order.includes(mid)) push(mid);
       providers.set(pid, { label: typeof rule.providerName === 'string' ? rule.providerName : pid, order: providerOrder.indexOf(pid), models: ordered });
     }
     const data = { providerOrder, providers };
@@ -781,6 +794,7 @@ function mergedModelEntries(s) {
 }
 
 function buildConfigOptions(s) {
+  if (!CONFIG_OPTIONS_ON) return []; // v0.1 兼容档：宿主只见 models/modes 块
   const entries = mergedModelEntries(s);
   const cur = decodeModelValue(s.currentModelId);
   const currentValue = cur ? encModelValue(cur.providerId, cur.modelId) : (entries[0] ? encModelValue(entries[0].providerId, entries[0].modelId) : '');
@@ -825,6 +839,16 @@ function buildConfigOptions(s) {
       options: tl.available.map(a => ({ value: a.value, name: a.label })),
     });
   }
+  // 模式（codeg 的 UI 互斥规则：有 configOptions 就不渲染 modes 块的模式选择器——
+  // 不补这条，build/plan/yolo 在 codeg 里将不可达。MindFS 兼容档下 modes/set_mode 通道照旧）
+  configOptions.push({
+    id: 'mode',
+    name: '模式',
+    category: 'mode',
+    type: 'select',
+    currentValue: ZCODE_MODES.some(m => m.id === s.currentMode) ? s.currentMode : ZCODE_MODES[0].id,
+    options: ZCODE_MODES.map(m => ({ value: m.id, name: m.name })),
+  });
   return configOptions;
 }
 
@@ -863,6 +887,7 @@ function pushAdvertisedCommands(sid) {
 
 // 会话中模型/思考深度变更后重推（建立期走 session/new|load|resume 响应内嵌 configOptions）
 function pushConfigOptions(s) {
+  if (!CONFIG_OPTIONS_ON) return; // v0.1 兼容档：不发新通知类型
   notifySessionUpdate(s.zsid, { sessionUpdate: 'config_option_update', configOptions: buildConfigOptions(s) });
 }
 
@@ -960,6 +985,13 @@ async function applyConfigOption(s, zc, configId, value) {
     if (s.thoughtLevels) s.thoughtLevels.current = value;
     return;
   }
+  if (configId === 'mode') {
+    const mode = ZCODE_MODES.some(m => m.id === value) ? value : null;
+    if (!mode) throw new Error(`unsupported mode: ${value}`);
+    await zc.request('session/setMode', { sessionId: s.zsid, mode }, 15000);
+    s.currentMode = mode;
+    return;
+  }
   const err = new Error(`unknown config option: ${configId}`);
   err.code = -32602;
   throw err;
@@ -1003,8 +1035,10 @@ async function handleAcpRequest(id, method, params) {
         sessions.set(s.zsid, s);
         // 预响应推送可用（宿主 runtime 对带 sessionId 的未认领通知暂存重放）；命令无 set 语义，安全
         pushAdvertisedCommands(s.zsid);
-        // 建立期 configOptions 走响应内嵌（宿主按此做偏好回放，顺序安全）
-        result = { sessionId: s.zsid, models: acpModelsBlock(s), modes: acpModesBlock(s), configOptions: buildConfigOptions(s) };
+        // 建立期 configOptions 走响应内嵌（宿主按此做偏好回放，顺序安全）；v0.1 兼容档整个不发——
+        // 空数组与缺字段对 codeg 不同（hasConfigOptions 判存在性），必须省键让宿主回退 modes 通道
+        result = { sessionId: s.zsid, models: acpModelsBlock(s), modes: acpModesBlock(s),
+          ...(CONFIG_OPTIONS_ON ? { configOptions: buildConfigOptions(s) } : {}) };
         break;
       }
 
@@ -1101,16 +1135,29 @@ async function handleAcpRequest(id, method, params) {
               }, TURN_WATCHDOG_MS);
             });
             s.pendingTurnOp = true;
+            let rrCompact;
             try {
-              await zc.request('session/compact', cparams, 30000);
+              rrCompact = await zc.request('session/compact', cparams, 30000);
             } catch (e) {
               s.pendingTurnOp = false;
               endTurn(s, 'end_turn'); // 释放 waiter/看门狗（事件可能已在途）
               throw new Error(`session/compact failed: ${String(e?.message || e).slice(0, 200)}`);
             }
             s.pendingTurnOp = false;
-            // 请求成功后补发 in_progress 卡；若已被 cancel/缓冲收口则无需再发
-            if (s.turnWaiter && !s.compaction.inProgressSent) emitCompactionCard(s, 'in_progress');
+            // 真实 zcode：state ∈ accepted|already_running。已在压缩中→不重复发卡（否则卡片计数错位），
+            // 但 turn.started/completed 照常广播，waiter 继续等后台那轮收口
+            const cstate = rrCompact?.result?.state || rrCompact?.result?.compact?.state;
+            if (cstate === 'already_running') {
+              log('compact already running, following its turn');
+              s.compaction = null;
+              // 在飞压缩的 turn.started 早已过去（先于本 waiter）——代际证据手动作证，
+              // 否则它的 turn.completed 会被判 stale，本 prompt 挂到看门狗
+              s.sawTurnStarted = true;
+              notifySessionUpdate(s.zsid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '[zcode] 压缩已在进行中，等待其完成' } });
+            } else if (s.turnWaiter && !s.compaction.inProgressSent) {
+              // 请求成功后补发 in_progress 卡；若已被 cancel/缓冲收口则无需再发
+              emitCompactionCard(s, 'in_progress');
+            }
             // 同 chunk 情形：终结事件先于本协程恢复到达，已缓存——现在 waiter 已挂，立即重放
             if (s.bufferedTurnEnd) { const b = s.bufferedTurnEnd; s.bufferedTurnEnd = null; finishTurn(s, s.zsid, b.kind, b.p); }
             result = { stopReason: (await done).stopReason || 'end_turn' };
@@ -1164,6 +1211,35 @@ async function handleAcpRequest(id, method, params) {
         const zc = await ensureZcode(s);
         await zc.request('session/setMode', { sessionId: s.zsid, mode }, 15000);
         s.currentMode = mode;
+        result = {};
+        break;
+      }
+
+      // v0.1 兼容层：MindFS 模型切换走这条（v0.2 起 codeg 走 set_config_option，此方法对它无副作用——
+      // session/set_model 是稳定 ACP schema 已废弃的方法，codeg 仅 Grok 专用路径消费）。缺了它 MindFS 切模型必报 -32601。
+      case 'session/set_model': {
+        const s = sessions.get(params?.sessionId);
+        if (!s) throw new Error(`unknown session: ${params?.sessionId}`);
+        // 编码 provider␟model[␟level]（level 可选，本桥发放的 modelId 自带）
+        const parts = String(params?.modelId || '').split(SEP);
+        if (parts.length < 2) throw new Error(`modelId must be providerId${SEP}modelId (issued by this bridge)`);
+        const [providerId, modelId, level] = parts;
+        const model = { providerId, modelId };
+        if (level) model.options = { reasoningLevel: level };
+        let applied = params.modelId;
+        const zc = await ensureZcode(s);
+        try {
+          await zc.request('session/setModel', { sessionId: s.zsid, model }, 15000);
+        } catch (e) {
+          const msg = String(e?.message || e);
+          if (!level && /reasoning/i.test(msg)) {
+            // 该模型强制要求 reasoning 级别 → 回落 low
+            await zc.request('session/setModel', { sessionId: s.zsid, model: { ...model, options: { reasoningLevel: 'low' } } }, 15000);
+            applied = `${params.modelId}${SEP}low`;
+          } else throw e;
+        }
+        s.currentModelId = applied;
+        s.providerId = providerId;
         result = {};
         break;
       }

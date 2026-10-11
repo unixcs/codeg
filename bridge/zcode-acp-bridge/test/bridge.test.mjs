@@ -229,6 +229,67 @@ test('set_config_option reasoning_effort → zcode setThoughtLevel', async () =>
   });
 });
 
+test('configOptions 含 mode 选项；set_config_option mode → zcode setMode（codeg 模式选择器补位）', async () => {
+  await withBridge({}, async (b) => {
+    await initialize(b, 1);
+    b.request(2, 'session/new', { cwd: '/tmp' });
+    const nr = await b.responseFor(2);
+    const sid = nr.result.sessionId;
+    // 建立：codeg 有 configOptions 时不渲染 modes 选择器（UI 互斥），mode 必须以 configOption 补位
+    const modeOpt = nr.result.configOptions.find(o => o.id === 'mode');
+    assert.ok(modeOpt, 'mode config option present');
+    assert.equal(modeOpt.category, 'mode');
+    assert.ok(modeOpt.options.length >= 4, 'all bridge modes offered');
+    // 切模式走 set_config_option → zcode setMode，应答清单 currentValue 跟随
+    b.request(3, 'session/set_config_option', { sessionId: sid, configId: 'mode', value: 'plan' });
+    const r = await b.responseFor(3);
+    assert.equal(r.result.configOptions.find(o => o.id === 'mode').currentValue, 'plan');
+    const actions = await b.actions();
+    const sm = actions.filter(a => a.method === 'session/setMode').pop();
+    assert.equal(sm.params.mode, 'plan');
+  });
+});
+
+test('session/set_model（v0.1 MindFS 契约）→ zcode setModel，provider␟model 解码', async () => {
+  await withBridge({}, async (b) => {
+    await initialize(b, 1);
+    b.request(2, 'session/new', { cwd: '/tmp' });
+    const sid = (await b.responseFor(2)).result.sessionId;
+    b.request(3, 'session/set_model', { sessionId: sid, modelId: `new-provider${SEP}cn:glm-5.3-flash` });
+    const r = await b.responseFor(3);
+    assert.ok(r.result, 'set_model succeeds (no -32601)');
+    const actions = await b.actions();
+    const setModel = actions.filter(a => a.method === 'session/setModel').pop();
+    assert.ok(setModel, 'setModel called');
+    assert.deepEqual(setModel.params.model, { providerId: 'new-provider', modelId: 'cn:glm-5.3-flash' });
+    // models 块 currentModelId 跟随（MindFS 下拉标在用模型）
+    b.request(4, 'session/load', { sessionId: sid, cwd: '/tmp' });
+    const lr = await b.responseFor(4);
+    assert.equal(lr.result.models.currentModelId, `new-provider${SEP}cn:glm-5.3-flash`);
+  });
+});
+
+test('BRIDGE_CONFIG_OPTIONS=off（v0.1 兼容档）：无 configOptions 键、无推送、/compact 不拦截', async () => {
+  await withBridge({ env: { BRIDGE_CONFIG_OPTIONS: 'off' } }, async (b) => {
+    await initialize(b, 1);
+    b.request(2, 'session/new', { cwd: '/tmp' });
+    const nr = await b.responseFor(2);
+    assert.ok(!('configOptions' in nr.result), 'no configOptions key in session/new result');
+    const sid = nr.result.sessionId;
+    // /compact 不再被拦截：作为普通 prompt 直通 zcode（v0.1 语义）
+    b.request(3, 'session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '/compact' }] });
+    const pr = await b.responseFor(3);
+    assert.equal(pr.result.stopReason, 'end_turn');
+    const actions = await b.actions();
+    assert.ok(actions.some(a => a.method === 'session/send' && /\/compact/.test(a.params.content || '')), '/compact went through as regular prompt');
+    assert.ok(!actions.some(a => a.method === 'session/compact'), 'no session/compact call');
+    // 无新增通知类型：available_commands_update / config_option_update 都不发
+    const kinds = b.stdout.filter(m => m.method === 'session/update').map(m => m.params?.update?.sessionUpdate);
+    assert.ok(!kinds.includes('available_commands_update'), 'no advertised commands');
+    assert.ok(!kinds.includes('config_option_update'), 'no config option pushes');
+  });
+});
+
 test('set_config_option：boolean 形状拒绝、未知 configId -32602、value 缺失 -32602', async () => {
   await withBridge({}, async (b) => {
     await initialize(b, 1);
