@@ -1,0 +1,1107 @@
+#!/usr/bin/env node
+// zcode-acp-bridge — ACP (Agent Client Protocol) agent ⇄ ZCode Protocol (zcode app-server --stdio) 适配器
+// v0.2.0。前作：批v60 v0.1.1（协议依据：30-方案/AIOS-批v60-zcode协议摸排报告-2026-10-11.md）。
+//
+// v0.2 新增（对齐 codeg 的 config option 机制，零宿主改动）：
+//   1. 模型选择器：session/new 响应携带 configOptions（id="model" + category="model" 的 select，
+//      平铺 type/currentValue/options；多 provider 时用 v1 的分组 options:[{group,name,options}]），
+//      并处理宿主回发的 session/set_config_option → zcode session/setModel。
+//   2. 思考深度选择器：configOptions 里的 id="reasoning_effort" → zcode session/setThoughtLevel。
+//   3. /compact 手动压缩：available_commands_update 宣告；prompt 首文本块命中 /compact 时拦截，
+//      调 zcode session/compact（异步 turn），以 compaction_update 卡片回报生命周期。
+//   4. 模型清单三层合并：BRIDGE_MODELS（手动）∪ session/read available（实时）∪
+//      $BRIDGE_ZCODE_HOME/.zcode/v2/provider_config.json（zcode 配置全量，默认截 top:16）。
+//
+// 用法（Codeg 自定义 agent / MindFS agents.json）：
+//   { "name": "zcode", "brief": "...", "command": "zcode-acp-bridge", "protocol": "acp", "args": [] }
+// 环境变量：
+//   BRIDGE_PERMISSION_MODE   = allow（默认，切 yolo 模式全放行）| deny（保持默认模式，权限请求一律拒）
+//   BRIDGE_ZCODE_BIN         = zcode 可执行名/路径（默认 "zcode"；多实例时指向各运行时）
+//   BRIDGE_ZCODE_HOME        = 传给 app-server 的 HOME（借用某实例的配置目录/登录态；缺省继承本进程 HOME）。
+//                              ⚠️ provider_config.json 也按此 HOME 解析——桥进程自身的 HOME 不会随之改变。
+//   BRIDGE_MODELS            = 逗号分隔的手动模型清单，如 "kimi-k3@low,cn:glm-5.3-flash@max"
+//                              （格式 modelId[@reasoningLevel]；provider 取会话当前 provider。排最前。）
+//   BRIDGE_DEFAULT_MODEL     = 会话建立时默认切到的模型（格式同上；缺省取 BRIDGE_MODELS 第一项）
+//   BRIDGE_CONFIG_MODELS     = 配置层清单开关/截断："top:N"（默认 top:16）| "all" | "off"
+//   BRIDGE_COMPACT           = on（默认）| off —— 是否宣告并接管 /compact
+//   BRIDGE_THOUGHT_LEVEL     = on（默认）| off —— 是否暴露思考深度选择器
+//   BRIDGE_LOG_DIR           = 日志目录（默认 /tmp/zcode-acp-bridge）
+// 纪律：
+//   - stderr 绝不输出含 "code":"..."+"message":"..." 形状的行（MindFS 会据此取消在飞 prompt）；日志进文件。
+//   - 无第三方依赖，Node >= 18。
+//
+// 规范偏离声明：ACP session-compaction RFD 要求 client 宣告 clientCapabilities.session.compaction
+// 后 agent 才可发送 compaction_update。codeg 只对 ClaudeCode|Codex 宣告该能力，但其消费路径
+// （connection.rs session_compaction_event）对任意 agent 的入站帧均解析；经审查，桥对 codeg
+// 始终发送 compaction_update（status ∈ in_progress|completed|failed，不用 cancelled）。
+
+import { spawn } from 'node:child_process';
+import { mkdirSync, appendFileSync, statSync, renameSync, readFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+
+// 版本探测：ACP 宿主（Codeg 等）preflight 会跑 `agent --version`；不处理会挂在 stdio 等输入
+if (process.argv.some(a => a === '--version' || a === '-V' || a === '-v')) {
+  console.log('zcode-acp-bridge 0.2.0');
+  process.exit(0);
+}
+
+const PERM_MODE = (process.env.BRIDGE_PERMISSION_MODE || 'allow').toLowerCase();
+const ZCODE_BIN = process.env.BRIDGE_ZCODE_BIN || 'zcode';
+const ZCODE_HOME = process.env.BRIDGE_ZCODE_HOME || undefined;
+const LOG_DIR = process.env.BRIDGE_LOG_DIR || '/tmp/zcode-acp-bridge';
+const COMPACT_ON = (process.env.BRIDGE_COMPACT || 'on').toLowerCase() !== 'off';
+const THOUGHT_ON = (process.env.BRIDGE_THOUGHT_LEVEL || 'on').toLowerCase() !== 'off';
+const SEP = '\u241f'; // ␟ 单元分隔符：provider␟model[␟level]，拆分安全（两字段本身可含冒号）
+
+// BRIDGE_CONFIG_MODELS 解析：off | all | top:N（默认 16）
+const CONFIG_MODELS_RAW = (process.env.BRIDGE_CONFIG_MODELS || 'top:16').trim().toLowerCase();
+const CONFIG_MODELS = CONFIG_MODELS_RAW === 'off' ? { mode: 'off' }
+  : CONFIG_MODELS_RAW === 'all' ? { mode: 'all' }
+  : { mode: 'top', limit: Math.max(1, parseInt(CONFIG_MODELS_RAW.replace(/^top:/, ''), 10) || 16) };
+
+// "kimi-k3@low,cn:glm-5.3-flash@max" -> [{modelId:'kimi-k3', level:'low'}, ...]
+const ENV_MODELS = (process.env.BRIDGE_MODELS || '').split(',').map(x => x.trim()).filter(Boolean)
+  .map(entry => {
+    const at = entry.indexOf('@');
+    return at < 0 ? { modelId: entry, level: undefined } : { modelId: entry.slice(0, at), level: entry.slice(at + 1) };
+  });
+const DEFAULT_MODEL = process.env.BRIDGE_DEFAULT_MODEL || (ENV_MODELS[0]
+  ? (ENV_MODELS[0].level ? `${ENV_MODELS[0].modelId}@${ENV_MODELS[0].level}` : ENV_MODELS[0].modelId)
+  : undefined);
+const ACP_PROTOCOL_VERSION = 1;
+const ZCODE_MODES = [
+  { id: 'plan', name: 'Plan（只读规划）', kind: 'read' },
+  { id: 'build', name: 'Build（写前确认）', kind: 'execute' },
+  { id: 'edit', name: 'Edit（自动改文件）', kind: 'edit' },
+  { id: 'yolo', name: 'YOLO（全放行）', kind: 'execute' },
+  { id: 'auto', name: 'Auto（自动）', kind: 'execute' },
+];
+const COMPACT_COMMANDS = [{ name: 'compact', description: '手动压缩上下文（zcode /compact，可带指示文字）' }];
+const COMPACT_RE = /^\/compact(?:\s+([\s\S]+))?$/i;
+
+try { mkdirSync(LOG_DIR, { recursive: true }); } catch {}
+const LOG_FILE = join(LOG_DIR, `bridge-${process.pid}.log`);
+function log(...args) {
+  try {
+    // 单文件超 8MB 滚一份 .old，防小盘被长跑日志吃穿（回收型进程每会话一个，双文件封顶 ~16MB）
+    try { if (statSync(LOG_FILE).size > 8 * 1024 * 1024) renameSync(LOG_FILE, LOG_FILE.replace(/\.log$/, '.old.log')); } catch {}
+    appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ')}\n`);
+  } catch {}
+}
+log('bridge start', { pid: process.pid, PERM_MODE, ZCODE_BIN, COMPACT_ON, THOUGHT_ON, CONFIG_MODELS });
+
+// ---------- ACP 侧输出（stdout NDJSON，标准 JSON-RPC 2.0 信封） ----------
+// 注意两侧不对称：ACP/JSON-RPC 侧带 "jsonrpc":"2.0"（Codeg Rust serde 可能强校验）；
+// zcode 侧（zcodeSend）绝不能带——zcode app-server 对含 jsonrpc 字段的行静默丢弃。
+function acpSend(msg) {
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...msg }) + '\n');
+}
+
+// ---------- ACP 会话状态 ----------
+// sessionId(ACP=zcode 原生 sessionId) -> { zc, zsid, cwd, workspaceKey, models, currentModelId,
+//   currentMode, thoughtLevels, liveModels, providerId, seenToolCalls, partStarted, turnWaiter,
+//   compaction, compactSeq, opQueue, stopReason, closed }
+const sessions = new Map();
+const allChildren = new Set(); // 全量子进程登记：会话条目被覆盖/删除后仍能收尸，防 ~300MB 孤儿
+
+function workspaceKeyOf(cwd) {
+  return cwd.replace(/\//g, '-') || '-';
+}
+
+// ---------- zcode 配置层模型清单（provider_config.json） ----------
+// $BRIDGE_ZCODE_HOME(缺省进程 HOME)/.zcode/v2/provider_config.json
+// 形状：{ schemaVersion, config: { providerOrder: [pid...], providerConfigRules: { providerRules:
+//        [{ providerId, providerName?, config: { personalModelIds?: [mid...], builtinModelIds?: [mid...],
+//           modelOrder?: [mid...] } }] } } }
+// 只取模型 id 清单，绝不读/外发 apiKey。mtime 缓存避免每会话重读。
+let cfgCache = { path: null, mtime: 0, data: null };
+function readZcodeProviderConfig() {
+  const home = ZCODE_HOME || process.env.HOME || '';
+  if (!home) return null;
+  const path = join(home, '.zcode', 'v2', 'provider_config.json');
+  try {
+    if (!existsSync(path)) return null;
+    const mtime = statSync(path).mtimeMs;
+    if (cfgCache.path === path && cfgCache.mtime === mtime && cfgCache.data) return cfgCache.data;
+    const raw = JSON.parse(readFileSync(path, 'utf8'));
+    const cfg = raw?.config || {};
+    const rules = cfg?.providerConfigRules?.providerRules;
+    if (!Array.isArray(rules)) return null;
+    const providerOrder = Array.isArray(cfg.providerOrder) ? cfg.providerOrder : [];
+    const providers = new Map(); // pid -> { label, order, models: [mid...] }
+    for (const rule of rules) {
+      const pid = rule?.providerId;
+      if (!pid || typeof pid !== 'string') continue;
+      const c = rule.config || {};
+      const ordered = [];
+      const push = (arr) => { if (Array.isArray(arr)) for (const mid of arr) if (typeof mid === 'string' && mid && !ordered.includes(mid)) ordered.push(mid); };
+      push(c.modelOrder);
+      push(c.personalModelIds);
+      push(c.builtinModelIds);
+      providers.set(pid, { label: typeof rule.providerName === 'string' ? rule.providerName : pid, order: providerOrder.indexOf(pid), models: ordered });
+    }
+    const data = { providerOrder, providers };
+    cfgCache = { path, mtime, data };
+    return data;
+  } catch (e) {
+    log('provider_config.json read failed (config layer disabled)', String(e).slice(0, 200));
+    return null;
+  }
+}
+
+// 配置层模型（按 providerOrder → modelOrder → 其余 排序，截 top:N）
+function configLayerModels() {
+  if (CONFIG_MODELS.mode === 'off') return [];
+  const cfg = readZcodeProviderConfig();
+  if (!cfg) return [];
+  const out = [];
+  const pids = [...cfg.providers.keys()].sort((a, b) => {
+    const oa = cfg.providers.get(a).order, ob = cfg.providers.get(b).order;
+    return (oa < 0 ? 1e9 : oa) - (ob < 0 ? 1e9 : ob);
+  });
+  for (const pid of pids) {
+    const p = cfg.providers.get(pid);
+    for (const mid of p.models) {
+      if (CONFIG_MODELS.mode === 'top' && out.length >= CONFIG_MODELS.limit) return out;
+      out.push({ providerId: pid, modelId: mid, providerLabel: p.label });
+    }
+  }
+  return out;
+}
+
+// ---------- zcode 子进程管理 ----------
+function spawnZcode(cwd) {
+  const env = { ...process.env };
+  if (ZCODE_HOME) env.HOME = ZCODE_HOME;
+  const child = spawn(ZCODE_BIN, ['app-server', '--stdio'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
+  allChildren.add(child);
+  let buf = '';
+  let zid = 0;
+  const pending = new Map();
+  child.stdout.on('data', (d) => {
+    buf += d.toString();
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i); buf = buf.slice(i + 1);
+      if (!line.trim()) continue;
+      let m; try { m = JSON.parse(line); } catch { continue; }
+      if (m.id !== undefined && m.method) {
+        // 反向请求：runtime 偏好必须应答，否则 session/create 挂起
+        if (m.method === 'session/requestRuntimePreferences') {
+          child.stdin.write(JSON.stringify({ id: m.id, result: { nativeSearchEnhancementsEnabled: false } }) + '\n');
+        } else {
+          log('zcode reverse request (declining)', m.method);
+          child.stdin.write(JSON.stringify({ id: m.id, error: { code: -32601, message: 'Method not supported by bridge' } }) + '\n');
+        }
+        continue;
+      }
+      if (m.id !== undefined && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); continue; }
+      if (m.method) handleZcodeNotification(m);
+    }
+  });
+  child.stderr.on('data', (d) => log('zcode stderr:', String(d).trim().slice(0, 500)));
+  // 子进程死了/起不来：在飞请求立刻报错返回，别等各自超时
+  const failPending = (message) => {
+    for (const [id, p] of pending) { p({ error: { code: -1, message } }); pending.delete(id); }
+  };
+  child.on('error', (e) => { log('zcode child error', String(e)); failPending(`zcode child error: ${e.message}`); });
+  child.on('exit', (code, sig) => {
+    log('zcode child exit', { code, sig });
+    allChildren.delete(child);
+    failPending(`zcode child exited (${code}/${sig})`);
+    const s = [...sessions.values()].find(x => x.zc && x.zc.child === child);
+    if (s) {
+      s.zc = null; // 子进程没了：保留会话条目，下次 prompt 走 resume 重建
+      if (s.turnWaiter) {
+        notifySessionUpdate(s.zsid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '[zcode 进程退出，本轮终止]' } });
+        if (s.compaction) emitCompactionCard(s, 'failed', 'zcode 进程退出，压缩终止');
+        endTurn(s, 'end_turn');
+      }
+    }
+  });
+  return {
+    child,
+    request(method, params, timeoutMs = 30000) {
+      return new Promise((resolve, reject) => {
+        const id = ++zid;
+        const timer = setTimeout(() => { pending.delete(id); reject(new Error(`zcode timeout: ${method}`)); }, timeoutMs);
+        pending.set(id, (m) => {
+          clearTimeout(timer);
+          // zcode 错误响应（{id, error:{code,message}}）走 reject，调用方 catch 统一处理
+          if (m.error) {
+            const err = new Error(m.error.message || `zcode error: ${method}`);
+            err.zcodeCode = m.error.code;
+            reject(err);
+            return;
+          }
+          resolve(m);
+        });
+        child.stdin.write(JSON.stringify({ id, method, params }) + '\n');
+      });
+    },
+    kill() { try { child.kill('SIGKILL'); } catch {} },
+  };
+}
+
+// ---------- zcode 事件 → ACP session/update ----------
+function notifySessionUpdate(sid, update) {
+  acpSend({ method: 'session/update', params: { sessionId: sid, update } });
+}
+
+function toolKindOf(toolName) {
+  const n = (toolName || '').toLowerCase();
+  if (/(^|_)(read|view|glob|grep|search|ls|list)/.test(n)) return 'read';
+  if (/(edit|write|patch|apply|create|save)/.test(n)) return 'edit';
+  if (/(bash|exec|run|command|terminal|shell)/.test(n)) return 'execute';
+  if (/(fetch|web|http|browser)/.test(n)) return 'fetch';
+  if (/(think|plan|todo)/.test(n)) return 'think';
+  return 'other';
+}
+
+// compaction_update 卡片（status ∈ in_progress|completed|failed；不用 cancelled——codeg 前端
+// 工具状态联合类型里没有它）。_meta.contextCompaction 富字段全部可选，缺省 codeg 自补 {version:1}。
+function emitCompactionCard(s, status, error, extraMeta) {
+  if (!s.compaction) return;
+  const meta = { contextCompaction: { version: 1, trigger: 'manual', ...(extraMeta || {}) } };
+  const upd = { sessionUpdate: 'compaction_update', compactionId: s.compaction.id, status };
+  if (error) upd.error = error;
+  upd._meta = meta;
+  notifySessionUpdate(s.zsid, upd);
+  log('compaction card', status, s.compaction.id, error || '');
+}
+
+function handleZcodeNotification(m) {
+  const method = m.method;
+  if (method !== 'session/event' && method !== 'state.updated') return; // 遥测/存储等一律忽略
+  const sid = m.params?.sessionId;
+  if (!sid) return;
+  const s = sessions.get(sid);
+  if (!s) return;
+
+  if (method === 'state.updated') {
+    // 投影补丁：status 等。v1 不透传（MindFS 不消费）；仅记录。不算活跃（文件监听等噪声会饿死回收器）
+    return;
+  }
+  s.lastActivity = Date.now(); // 真实的 turn 事件才算活跃，闲置回收计时从这重算
+
+  const ev = m.params; // {type, payload, seq, eventId, deliveryKind}
+  const type = ev.type;
+  const p = ev.payload || {};
+  // 高频流式 delta 不逐条落盘（一轮数千条，长跑 GB 级）；其余事件照常
+  if (type !== 'part.delta' && type !== 'model.streaming') log('event', type, JSON.stringify(p).slice(0, 300));
+
+  switch (type) {
+    case 'session.titleUpdated':
+      // MindFS 用会话 key 管理标题，标题变化不透传（无对应 ACP 通知）
+      break;
+
+    case 'turn.started':
+      s.fullTextLen = 0; // 新一轮：全文增量追踪归零
+      break;
+
+    case 'part.delta': {
+      const text = p.delta || '';
+      if (!text) break;
+      if (p.field === 'reasoning') {
+        s.sawText = true;
+        notifySessionUpdate(sid, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text } });
+      } else if (p.field === 'text' || p.field === undefined) {
+        s.sawText = true;
+        s.fullTextLen += text.length; // 与 message.upserted 兜底共享同一增量水位
+        notifySessionUpdate(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } });
+      }
+      // field input/output 是工具流的内部增量，v1 不透传（tool.updated 已带全量）
+      break;
+    }
+
+    // 3.14.x 词表兜底：整条消息 upsert（payload {content,...}）。只补发相对本轮已发前缀的增量，
+    // 与 part.delta 共用水位——两套词表谁在流式都不重复、都不缺。
+    case 'message.upserted': {
+      const text = typeof p.content === 'string' ? p.content : '';
+      if (text.length > (s.fullTextLen || 0)) {
+        const suffix = text.slice(s.fullTextLen || 0);
+        s.sawText = true;
+        s.fullTextLen = text.length;
+        notifySessionUpdate(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: suffix } });
+      }
+      break;
+    }
+
+    // 词表 B（zcode CLI 0.16.x 实测）：文本/工具输入流都走 model.streaming
+    case 'model.streaming': {
+      const kind = p.kind || 'text_delta';
+      if ((kind === 'text_delta' || kind === 'reasoning_delta') && p.delta) {
+        s.sawText = true;
+        notifySessionUpdate(sid, kind === 'reasoning_delta'
+          ? { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: p.delta } }
+          : { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: p.delta } });
+      }
+      break;
+    }
+
+    case 'part.upserted': {
+      const part = p.part || {};
+      if (part.type === 'tool') {
+        emitToolPart(sid, s, part);
+      } else if (part.type === 'compaction') {
+        // 压缩 turn 的产物 part：能捞到多少富字段捞多少（防御式，字段名以实测为准）
+        if (s.compaction) {
+          if (Number.isFinite(part.preTokens)) s.compaction.pre = part.preTokens;
+          if (Number.isFinite(part.postTokens)) s.compaction.post = part.postTokens;
+          if (typeof part.summary === 'string' && part.summary) s.compaction.summary = part.summary;
+        }
+      }
+      // text/reasoning 的整段 upsert：若该 part 已流过 delta 则忽略；否则作为一次 chunk 补发
+      else if (part.type === 'text' || part.type === 'reasoning') {
+        const key = `${part.messageId}/${part.partId}`;
+        if (!s.partStarted.has(key)) {
+          s.partStarted.add(key);
+          const text = part.text || '';
+          if (text) {
+            notifySessionUpdate(sid, part.type === 'reasoning'
+              ? { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text } }
+              : { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } });
+          }
+        }
+      }
+      break;
+    }
+
+    case 'tool.updated':
+      emitToolUpdated(sid, s, p);
+      break;
+
+    case 'permission.requested': {
+      // allow 档：yolo 生效时不应出现；出现（版本差异 yolo 不可用）则尽力自动批准，救不动就止损收口
+      if (PERM_MODE === 'allow' && p.requestId) {
+        const allowOpt = (p.options || []).find(o => /allow|approve|accept|proceed|always/i.test(o.kind || o.optionId || o.name || ''));
+        if (allowOpt?.optionId && s.zc) {
+          s.zc.request('v4/command', {
+            sessionId: sid,
+            type: 'resolveInteraction',
+            payload: { resolveInteraction: { interactionId: p.requestId, answer: { optionId: allowOpt.optionId } } },
+          }).catch(e => log('allow resolveInteraction failed', String(e).slice(0, 150)));
+        } else {
+          // 不发猜测的 optionId：直接止损，别让这轮挂到 25min 看门狗
+          log('allow mode: no approvable option, stopping turn', JSON.stringify(p).slice(0, 150));
+          s.zc?.request('session/stop', { sessionId: sid }, 10000).catch(() => {});
+          if (s.compaction) emitCompactionCard(s, 'failed', 'permission stuck during compaction');
+          endTurn(s, 'refusal');
+        }
+      } else if (PERM_MODE === 'deny' && p.requestId) {
+        const denyOpt = (p.options || []).find(o => /deny|reject/i.test(o.kind || o.optionId || ''));
+        if (denyOpt?.optionId && s.zc) {
+          s.zc.request('v4/command', {
+            sessionId: sid,
+            type: 'resolveInteraction',
+            payload: { resolveInteraction: { interactionId: p.requestId, answer: { optionId: denyOpt.optionId } } },
+          }).catch(e => log('deny resolveInteraction failed', String(e)));
+        } else {
+          log('deny mode: no matching option, stopping turn', JSON.stringify(p).slice(0, 150));
+          s.zc?.request('session/stop', { sessionId: sid }, 10000).catch(() => {});
+          if (s.compaction) emitCompactionCard(s, 'failed', 'denied during compaction');
+          endTurn(s, 'refusal');
+        }
+      } else {
+        log('permission.requested unexpected', JSON.stringify(p).slice(0, 200));
+      }
+      break;
+    }
+
+    case 'turn.completed': {
+      // 无在飞 prompt 的 completed 是上一轮被 cancel/看门狗收口后的迟到事件：只记录，不重放不收口
+      if (!s.turnWaiter) { log('stale turn.completed ignored (no waiter)'); break; }
+      // 保险：万一 delta 流没接住（词表差异/订阅晚到），0.16.x 的 payload.response 是全量文本
+      if (!s.sawText && p.response) {
+        notifySessionUpdate(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: String(p.response) } });
+      }
+      s.sawText = false;
+      s.fullTextLen = 0;
+      if (s.compaction) {
+        const meta = {};
+        if (Number.isFinite(s.compaction.pre)) meta.preTokens = s.compaction.pre;
+        if (Number.isFinite(s.compaction.post)) meta.postTokens = s.compaction.post;
+        if (Number.isFinite(p.duration)) meta.durationMs = p.duration;
+        if (s.compaction.summary) meta.summary = s.compaction.summary;
+        emitCompactionCard(s, 'completed', undefined, meta);
+      }
+      endTurn(s, 'end_turn');
+      break;
+    }
+
+    case 'turn.failed': {
+      const errMsg = p.error?.message || p.error?.detail || 'turn failed';
+      if (s.compaction) {
+        emitCompactionCard(s, 'failed', errMsg);
+      } else {
+        notifySessionUpdate(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `[zcode turn failed] ${errMsg}` } });
+      }
+      endTurn(s, 'end_turn');
+      break;
+    }
+
+    default:
+      break;
+  }
+}
+
+function endTurn(s, stopReason) {
+  if (!s.turnWaiter) return;
+  s.lastStopReason = stopReason;
+  if (s.turnWaiter.timer) clearTimeout(s.turnWaiter.timer);
+  const w = s.turnWaiter; s.turnWaiter = null;
+  w.resolve({ stopReason });
+}
+
+function emitToolPart(sid, s, part) {
+  // part.type=tool：state.status pending/running/completed/error
+  const st = part.state || {};
+  const toolCallId = part.toolCallId || part.partId;
+  const status = st.status;
+  const acpStatus = status === 'pending' ? 'pending' : status === 'running' ? 'in_progress'
+    : status === 'error' ? 'failed' : 'completed';
+  const raw = {
+    toolCallId, toolName: part.toolName || 'tool',
+    state: st, title: st.title || part.toolName || 'tool',
+  };
+  emitToolCommon(sid, s, raw, acpStatus);
+}
+
+function emitToolUpdated(sid, s, base) {
+  // 0.16.x 形状：kind=batch 是批量汇总（toolCallIds 复数），单卡已由各 result 事件宣告，跳过
+  if (base.kind === 'batch' && Array.isArray(base.toolCallIds)) return;
+  // 0.16.x 形状：无 kind 但带 result → 工具完成（result.content = 输出文本）
+  if (base.kind === undefined && base.result !== undefined) {
+    const out = base.result?.content !== undefined ? base.result.content : base.result;
+    return emitToolCommon(sid, s, { ...base, output: out }, base.result?.success === false ? 'failed' : 'completed');
+  }
+  // tool.updated payload = 基座字段 + state 变体之一（kind: scheduled/started/progress/result/error/...）
+  const kind = base.kind || base.state?.kind;
+  const acpStatus = kind === 'scheduled' ? 'pending'
+    : (kind === 'started' || kind === 'progress') ? 'in_progress'
+    : kind === 'error' ? 'failed'
+    : (kind === 'result' || kind === 'batch' || kind === 'raw') ? 'completed'
+    : base.dependencies !== undefined ? 'pending' // 0.16.x：无 kind + dependencies → 计划中
+    : 'in_progress';
+  emitToolCommon(sid, s, base, acpStatus);
+}
+
+function emitToolCommon(sid, s, t, acpStatus) {
+  const toolCallId = t.toolCallId;
+  if (!toolCallId) return;
+  // 0.16.x 的 result 事件可能不带 toolName/title → 沿用首宣告的标题（Map: id -> title）
+  let firstTitle = s.seenToolCalls.get?.(toolCallId);
+  if (typeof firstTitle !== 'string') firstTitle = undefined;
+  const title = (t.title && t.title !== 'tool') ? t.title
+    : (t.toolName && t.toolName !== 'tool') ? t.toolName
+    : (firstTitle || t.title || t.toolName || 'tool');
+  const kind = toolKindOf(t.toolName);
+  const rawInput = t.state?.input !== undefined ? t.state.input : t.input;
+  const output = t.state?.output !== undefined ? t.state.output
+    : (t.state?.status === 'error' ? t.state.error : t.output);
+  const upd = { sessionUpdate: 'tool_call', toolCallId, title, kind, status: acpStatus };
+  if (rawInput !== undefined) upd.rawInput = rawInput;
+  if (output !== undefined && output !== null && String(output).length) {
+    upd.content = [{ type: 'content', content: { type: 'text', text: String(output).slice(0, 20000) } }];
+  }
+  if (s.seenToolCalls.has(toolCallId)) {
+    // 已宣告过 → 只发变化字段
+    const u2 = { sessionUpdate: 'tool_call_update', toolCallId, status: acpStatus, title };
+    if (upd.content) u2.content = upd.content;
+    notifySessionUpdate(sid, u2);
+  } else {
+    s.seenToolCalls.set(toolCallId, title);
+    notifySessionUpdate(sid, upd);
+  }
+}
+
+// ---------- 会话建立 ----------
+async function createZcodeSession(cwd) {
+  const zc = spawnZcode(cwd);
+  try {
+    return await initZcodeSession(zc, cwd);
+  } catch (e) { zc.kill(); throw e; } // 握手任何一步失败/超时都杀子进程，防 ~300MB 泄漏
+}
+
+// session/read 的 settings → 会话态（模型/思考深度实时层）
+function absorbSessionSettings(s, rd) {
+  const settings = rd?.result?.settings || rd?.result?.state?.settings;
+  if (!settings) return;
+  const avail = settings?.model?.available || [];
+  s.providerId = settings?.model?.current?.providerId || s.providerId;
+  s.liveModels = avail.map(mo => ({
+    ref: mo.ref,
+    label: mo.label || mo.ref?.modelId || mo.ref?.providerId || 'model',
+    providerLabel: mo.providerLabel,
+    description: [mo.contextWindow ? `ctx ${mo.contextWindow}` : null, mo.description].filter(Boolean).join('，'),
+  }));
+  const cur = settings?.model?.current;
+  if (cur?.providerId && cur?.modelId) {
+    s.currentModelId = `${cur.providerId}${SEP}${cur.modelId}` + (cur.options?.reasoningLevel ? `${SEP}${cur.options.reasoningLevel}` : '');
+  }
+  const tl = settings?.thoughtLevel;
+  if (tl && tl.enabled && Array.isArray(tl.available) && tl.available.length) {
+    s.thoughtLevels = {
+      current: typeof tl.current === 'string' ? tl.current : (tl.available.find(a => a.value === tl.defaultLevel)?.value || tl.available[0]?.value),
+      available: tl.available.map(a => ({ value: String(a.value ?? a), label: String(a.label ?? a.value ?? a) })),
+    };
+  } else if (tl && tl.enabled === false) {
+    s.thoughtLevels = null;
+  }
+  if (settings?.mode?.current) s.currentMode = settings.mode.current;
+}
+
+// spawn 之后的握手/清单/默认模型/订阅（由 createZcodeSession 包 try/catch 调用）
+async function initZcodeSession(zc, cwd) {
+  const workspaceKey = workspaceKeyOf(cwd);
+  const cr = await zc.request('session/create', { workspace: { workspacePath: cwd, workspaceKey } }, 45000); // 错误响应走 reject
+  const zsid = cr.result?.session?.sessionId;
+  if (!zsid) throw new Error('session/create returned no sessionId');
+  log('zcode session created', zsid, 'pid', zc.child.pid);
+
+  const s = newSessionState(zc, zsid, cwd, workspaceKey);
+  try {
+    const rd = await zc.request('session/read', { sessionId: zsid }, 20000);
+    absorbSessionSettings(s, rd);
+  } catch (e) { log('session/read failed (fallback to env/config layers)', String(e)); }
+
+  if (PERM_MODE === 'allow') {
+    try {
+      await zc.request('session/setMode', { sessionId: zsid, mode: 'yolo' }, 10000);
+      s.currentMode = 'yolo';
+    } catch (e) { log('setMode yolo failed', String(e)); }
+  }
+
+  // 默认模型：BRIDGE_DEFAULT_MODEL（或清单第一项）。setModel 需带 reasoningLevel（kimi-k3 等强校验）；
+  // 未指定级别时先裸切，被拒则回落 low。
+  if (DEFAULT_MODEL) {
+    const at = DEFAULT_MODEL.indexOf('@');
+    const mid = at < 0 ? DEFAULT_MODEL : DEFAULT_MODEL.slice(0, at);
+    const level = at < 0 ? undefined : DEFAULT_MODEL.slice(at + 1);
+    const model = { providerId: s.providerId, modelId: mid };
+    if (level) model.options = { reasoningLevel: level };
+    try {
+      await zc.request('session/setModel', { sessionId: zsid, model }, 15000);
+    } catch (e) {
+      const msg = String(e?.message || e);
+      if (!level && /reasoning/i.test(msg)) {
+        try {
+          await zc.request('session/setModel', { sessionId: zsid, model: { ...model, options: { reasoningLevel: 'low' } } }, 15000);
+        } catch (e2) { log('setModel default(low) failed', String(e2).slice(0, 200)); }
+      } else log('setModel default failed', msg.slice(0, 200));
+    }
+    s.currentModelId = `${s.providerId}${SEP}${mid}` + (level ? `${SEP}${level}` : '');
+  }
+
+  // 订阅事件流
+  await zc.request('session/subscribe', { sessionId: zsid, deliveryKind: 'desktop-continuous' }, 15000).catch(e => log('subscribe failed', String(e)));
+  return s;
+}
+
+function newSessionState(zc, zsid, cwd, workspaceKey) {
+  return {
+    zc, zsid, cwd, workspaceKey,
+    models: [],            // v0.1 兼容层：session/new|load|resume 响应里的 models 块（MindFS 消费）
+    currentModelId: null,
+    currentMode: 'build',
+    providerId: 'new-provider',
+    liveModels: [],        // session/read available 实时层
+    thoughtLevels: null,   // { current, available:[{value,label}] } | null
+    seenToolCalls: new Map(), partStarted: new Set(), turnWaiter: null,
+    compaction: null, compactSeq: 0,
+    opQueue: Promise.resolve(), // set_config_option 串行闸
+    lastStopReason: 'end_turn',
+    sawText: false, lastActivity: Date.now(), turnSeq: 0, busy: false, fullTextLen: 0, closed: false,
+  };
+}
+
+// 闲置回收：zcode 子进程 ~300MB 常驻太贵；空闲 IDLE_MS 后杀掉，下次 prompt 走 session/resume 秒级重建
+const IDLE_MS = parseInt(process.env.BRIDGE_IDLE_EXIT_MS || '', 10) || 10 * 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const s of sessions.values()) {
+    if (s.zc && !s.turnWaiter && !s.closed && now - (s.lastActivity || 0) > IDLE_MS) {
+      log('idle recycle: killing zcode child', s.zsid, `idle ${Math.round((now - s.lastActivity) / 1000)}s`);
+      s.zc.kill(); s.zc = null;
+    }
+  }
+}, 60 * 1000).unref();
+
+// ---------- config option 组装（codeg 模型/思考深度选择器的数据源） ----------
+// v1 wire 形状（平铺，不嵌套 kind；分组用 options:[{group,name,options}]）：
+//   { id, name, category?, type: 'select', currentValue, options: [...] }
+function encModelValue(providerId, modelId) {
+  return `${providerId}${SEP}${modelId}`;
+}
+function decodeModelValue(v) {
+  const parts = String(v || '').split(SEP);
+  if (parts.length < 2) return null;
+  return { providerId: parts[0], modelId: parts[1], level: parts[2] || undefined };
+}
+
+// 三层合并：manual（BRIDGE_MODELS）→ live（session/read available）→ config（provider_config.json）
+function mergedModelEntries(s) {
+  const entries = [];
+  for (const m of ENV_MODELS) {
+    entries.push({ providerId: s.providerId, modelId: m.modelId, name: m.modelId, description: '手动添加（BRIDGE_MODELS）', source: 'manual' });
+  }
+  for (const mo of s.liveModels || []) {
+    const pid = mo.ref?.providerId || s.providerId;
+    entries.push({
+      providerId: pid, modelId: mo.ref?.modelId,
+      name: (mo.label || mo.ref?.modelId) + (mo.providerLabel ? ` · ${mo.providerLabel}` : ''),
+      providerLabel: mo.providerLabel,
+      description: mo.description || undefined, source: 'live',
+    });
+  }
+  for (const m of configLayerModels()) {
+    entries.push({ providerId: m.providerId, modelId: m.modelId, name: m.modelId, description: undefined, source: 'config' });
+  }
+  // 当前模型兜底入选（session/read 失败/清空时 UI 仍能标出在用模型）
+  const cur = decodeModelValue(s.currentModelId);
+  if (cur && !entries.some(e => e.providerId === cur.providerId && e.modelId === cur.modelId)) {
+    entries.unshift({ providerId: cur.providerId, modelId: cur.modelId, name: cur.modelId, description: '当前模型', source: 'live' });
+  }
+  // 按 provider␟model 去重，先到先得（manual > live > config 的顺序即优先级）
+  const seen = new Set();
+  return entries.filter(e => {
+    if (!e.modelId) return false;
+    const key = encModelValue(e.providerId, e.modelId);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function buildConfigOptions(s) {
+  const entries = mergedModelEntries(s);
+  const cur = decodeModelValue(s.currentModelId);
+  const currentValue = cur ? encModelValue(cur.providerId, cur.modelId) : (entries[0] ? encModelValue(entries[0].providerId, entries[0].modelId) : '');
+
+  // 单 provider 平铺；多 provider 用 v1 服务端分组（group=providerId, name=providerLabel）
+  const providerIds = [...new Set(entries.map(e => e.providerId))];
+  let options;
+  if (providerIds.length > 1) {
+    const groupLabels = new Map();
+    for (const e of entries) if (!groupLabels.has(e.providerId)) groupLabels.set(e.providerId, e.source === 'manual' ? '手动添加' : (e.providerLabel || e.providerId));
+    const cfg = readZcodeProviderConfig();
+    for (const [pid, label] of groupLabels) if (cfg?.providers?.get(pid)?.label) groupLabels.set(pid, cfg.providers.get(pid).label);
+    options = providerIds.map(pid => ({
+      group: pid,
+      name: groupLabels.get(pid) || pid,
+      options: entries.filter(e => e.providerId === pid).map(e => ({ value: encModelValue(e.providerId, e.modelId), name: e.name, ...(e.description ? { description: e.description } : {}) })),
+    }));
+  } else {
+    options = entries.map(e => ({ value: encModelValue(e.providerId, e.modelId), name: e.name, ...(e.description ? { description: e.description } : {}) }));
+  }
+
+  const modelOption = {
+    id: 'model', // id + category 双信号（codeg 前端 isModelConfigOption / 后端 is_model_config_option 各认一个）
+    name: '模型',
+    category: 'model',
+    type: 'select',
+    currentValue,
+    options,
+  };
+
+  const configOptions = [modelOption];
+
+  // 思考深度（zcode session/setThoughtLevel；available 来自 session/read）
+  if (THOUGHT_ON && s.thoughtLevels && s.thoughtLevels.available.length) {
+    const tl = s.thoughtLevels;
+    configOptions.push({
+      id: 'reasoning_effort',
+      name: '思考深度',
+      category: 'model',
+      type: 'select',
+      currentValue: tl.available.some(a => a.value === tl.current) ? tl.current : (tl.available[0]?.value || ''),
+      options: tl.available.map(a => ({ value: a.value, name: a.label })),
+    });
+  }
+  return configOptions;
+}
+
+// v0.1 兼容层：models 块（MindFS 消费；codeg 忽略）。编码 provider␟model[␟level]，env 层带 level。
+function acpModelsBlock(s) {
+  const entries = mergedModelEntries(s);
+  const envSet = new Set(ENV_MODELS.map(m => m.modelId));
+  let models = entries.map(e => {
+    const env = ENV_MODELS.find(m => m.modelId === e.modelId);
+    const level = env?.level;
+    return {
+      ref: { providerId: e.providerId, modelId: e.modelId, ...(level ? { level } : {}) },
+      modelId: encModelValue(e.providerId, e.modelId) + (level ? `${SEP}${level}` : ''),
+      name: e.name,
+      description: e.description,
+    };
+  });
+  if (!models.length) models = [{ modelId: `default${SEP}default`, name: '默认模型（清单读取失败）' }];
+  return { availableModels: models, currentModelId: s.currentModelId || models[0].modelId };
+}
+
+function acpModesBlock(s) {
+  return {
+    availableModes: ZCODE_MODES.map(m => ({ id: m.id, name: m.name })),
+    currentModeId: s.currentMode,
+  };
+}
+
+// 宣告 /compact（宿主斜杠菜单；name/description 均必填，缺 description 的条目会被宿主静默丢弃）
+function pushAdvertisedCommands(sid) {
+  if (!COMPACT_ON) return;
+  notifySessionUpdate(sid, { sessionUpdate: 'available_commands_update', commands: COMPACT_COMMANDS });
+}
+
+// 会话中模型/思考深度变更后重推（建立期走 session/new|load|resume 响应内嵌 configOptions）
+function pushConfigOptions(s) {
+  notifySessionUpdate(s.zsid, { sessionUpdate: 'config_option_update', configOptions: buildConfigOptions(s) });
+}
+
+// session/load 与 session/resume 共用的收尾：读模型清单 → yolo → 订阅
+async function finishResumedSession(zc, zsid, s) {
+  try {
+    const rd = await zc.request('session/read', { sessionId: zsid }, 20000);
+    absorbSessionSettings(s, rd);
+  } catch (e) { log('session/read after resume failed', String(e)); }
+  // 与 initZcodeSession 相同的三层合并语义，保证恢复后的会话清单一致
+  s.models = acpModelsBlock(s).availableModels;
+  if (PERM_MODE === 'allow') {
+    try { await zc.request('session/setMode', { sessionId: zsid, mode: 'yolo' }, 10000); s.currentMode = 'yolo'; } catch {}
+  }
+  await zc.request('session/subscribe', { sessionId: zsid, deliveryKind: 'desktop-continuous' }, 15000).catch(e => log('subscribe after resume failed', String(e)));
+}
+
+// 子进程存活保证：被闲置回收/意外退出后，用原生 session/resume 重建（上下文在 zcode 侧持久，不丢）
+async function ensureZcode(s) {
+  if (s.zc && s.zc.child.exitCode === null && !s.zc.child.killed) return s.zc;
+  log('respawning zcode child', s.zsid);
+  const zc = spawnZcode(s.cwd);
+  try {
+    const rr = await zc.request('session/resume', { sessionId: s.zsid, workspace: { workspacePath: s.cwd, workspaceKey: s.workspaceKey } }, 45000);
+    s.zc = zc;
+    s.lastActivity = Date.now();
+    await finishResumedSession(zc, s.zsid, s);
+    return zc;
+  } catch (e) { zc.kill(); throw e; } // resume 失败/超时也杀子进程，防泄漏
+}
+
+// ---------- set_config_option 应用（串行闸内执行） ----------
+async function applyConfigOption(s, zc, configId, value) {
+  if (configId === 'model') {
+    const dec = decodeModelValue(value);
+    if (!dec) throw new Error(`invalid model value (expected providerId${SEP}modelId): ${value}`);
+    const model = { providerId: dec.providerId, modelId: dec.modelId };
+    if (dec.level) model.options = { reasoningLevel: dec.level };
+    try {
+      await zc.request('session/setModel', { sessionId: s.zsid, model }, 15000);
+    } catch (e) {
+      const msg = String(e?.message || e);
+      if (!dec.level && /reasoning/i.test(msg)) {
+        // 该模型强制要求 reasoning 级别 → 回落 low（currentValue 仍保持用户所选，不带 level）
+        await zc.request('session/setModel', { sessionId: s.zsid, model: { ...model, options: { reasoningLevel: 'low' } } }, 15000);
+      } else throw e;
+    }
+    s.currentModelId = encModelValue(dec.providerId, dec.modelId) + (dec.level ? `${SEP}${dec.level}` : '');
+    // 重读一次，吸收 zcode 侧真实状态（current/available/thoughtLevel 都可能因切模型而变）
+    try {
+      const rd = await zc.request('session/read', { sessionId: s.zsid }, 20000);
+      absorbSessionSettings(s, rd);
+      // absorb 会用 zcode 实际 current 覆盖 currentModelId（可能带 level）——保持无 level 视图供 UI 匹配
+      if (rd?.result?.settings?.model?.current?.providerId) {
+        s.currentModelId = encModelValue(rd.result.settings.model.current.providerId, rd.result.settings.model.current.modelId);
+      }
+    } catch (e) { log('session/read after setModel failed', String(e)); }
+    return;
+  }
+  if (configId === 'reasoning_effort') {
+    if (!/^[a-z0-9_-]+$/i.test(value)) throw new Error(`invalid thoughtLevel value: ${value}`);
+    await zc.request('session/setThoughtLevel', { sessionId: s.zsid, thoughtLevel: value }, 10000);
+    if (s.thoughtLevels) s.thoughtLevels.current = value;
+    return;
+  }
+  const err = new Error(`unknown config option: ${configId}`);
+  err.code = -32602;
+  throw err;
+}
+
+// ---------- ACP 请求分发 ----------
+async function handleAcpRequest(id, method, params) {
+  // 响应后执行的工作（如 config_option_update 重推）：load/resume 的清单重推必须在响应之后，
+  // 否则会跟宿主的偏好回放产生"暂存旧值视觉覆盖"的顺序问题
+  const postResponse = [];
+  try {
+    let result;
+    switch (method) {
+      case 'initialize':
+        result = {
+          protocolVersion: ACP_PROTOCOL_VERSION,
+          agentCapabilities: {
+            loadSession: true,
+            promptCapabilities: { audio: false, embeddedContext: false, image: false },
+            sessionCapabilities: { close: {}, resume: {} },
+          },
+          agentInfo: { name: 'zcode-acp-bridge', version: '0.2.0' },
+          authMethods: [],
+        };
+        break;
+
+      case 'session/new': {
+        const cwd = params?.cwd || process.cwd();
+        const s = await createZcodeSession(cwd);
+        const prev = sessions.get(s.zsid); // 理论上 zcode 不会复用 sessionId；真发生时收掉旧子进程防孤儿
+        if (prev) prev.zc?.kill();
+        sessions.set(s.zsid, s);
+        // 预响应推送可用（宿主 runtime 对带 sessionId 的未认领通知暂存重放）；命令无 set 语义，安全
+        pushAdvertisedCommands(s.zsid);
+        // 建立期 configOptions 走响应内嵌（宿主按此做偏好回放，顺序安全）
+        result = { sessionId: s.zsid, models: acpModelsBlock(s), modes: acpModesBlock(s), configOptions: buildConfigOptions(s) };
+        break;
+      }
+
+      case 'session/load': {
+        const cwd = params?.cwd || process.cwd();
+        const zsid = params?.sessionId;
+        if (!zsid) throw new Error('session/load: missing sessionId');
+        // 重复 load（UI 重连等）：复用已有条目，别再 spawn 一个子进程把旧的挤成孤儿
+        if (sessions.has(zsid)) {
+          const s0 = sessions.get(zsid);
+          const zc0 = await ensureZcode(s0);
+          await finishResumedSession(zc0, zsid, s0);
+          result = { models: acpModelsBlock(s0), modes: acpModesBlock(s0) };
+          postResponse.push(() => pushConfigOptions(s0));
+          break;
+        }
+        const zc = spawnZcode(cwd);
+        try {
+          const rr = await zc.request('session/resume', { sessionId: zsid, workspace: { workspacePath: cwd, workspaceKey: workspaceKeyOf(cwd) } }, 45000);
+          const s = newSessionState(zc, zsid, cwd, workspaceKeyOf(cwd));
+          // 回放历史：user text → user_message_chunk；assistant text → agent_message_chunk；tool → tool_call(completed)
+          const msgs = rr.result?.messages || [];
+          for (const msg of msgs) {
+            const role = msg.info?.role;
+            for (const part of msg.parts || []) {
+              if (part.type === 'text' && part.text) {
+                notifySessionUpdate(zsid, role === 'user'
+                  ? { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: part.text } }
+                  : { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: part.text } });
+              } else if (role === 'assistant' && part.type === 'tool' && part.state?.status) {
+                const toolCallId = part.toolCallId || part.partId;
+                s.seenToolCalls.set(toolCallId, part.state.title || part.toolName || 'tool');
+                notifySessionUpdate(zsid, {
+                  sessionUpdate: 'tool_call', toolCallId,
+                  title: part.state.title || part.toolName || 'tool',
+                  kind: toolKindOf(part.toolName),
+                  status: part.state.status === 'error' ? 'failed' : 'completed',
+                  rawInput: part.state.input,
+                });
+              }
+            }
+          }
+          await finishResumedSession(zc, zsid, s);
+          sessions.set(zsid, s);
+          result = { models: acpModelsBlock(s), modes: acpModesBlock(s) };
+          pushAdvertisedCommands(zsid);
+          postResponse.push(() => pushConfigOptions(s)); // load 无建立期偏好回放通道：响应后重推（无 set 语义竞态）
+        } catch (e) { zc.kill(); throw e; } // resume/回放失败/超时也杀子进程，防泄漏
+        break;
+      }
+
+      // ACP session/resume（MindFS 重启后走这条）：不回放消息——zcode app-server 原生记得全部上下文
+      case 'session/resume': {
+        const cwd = params?.cwd || process.cwd();
+        const zsid = params?.sessionId;
+        if (!zsid) throw new Error('session/resume: missing sessionId');
+        if (sessions.has(zsid)) {
+          const s0 = sessions.get(zsid);
+          const zc0 = await ensureZcode(s0);
+          await finishResumedSession(zc0, zsid, s0);
+          result = { models: acpModelsBlock(s0), modes: acpModesBlock(s0) };
+          postResponse.push(() => pushConfigOptions(s0));
+          break;
+        }
+        const zc = spawnZcode(cwd);
+        try {
+          const rr = await zc.request('session/resume', { sessionId: zsid, workspace: { workspacePath: cwd, workspaceKey: workspaceKeyOf(cwd) } }, 45000);
+          const s = newSessionState(zc, zsid, cwd, workspaceKeyOf(cwd));
+          await finishResumedSession(zc, zsid, s);
+          sessions.set(zsid, s);
+          result = { models: acpModelsBlock(s), modes: acpModesBlock(s) };
+          pushAdvertisedCommands(zsid);
+          postResponse.push(() => pushConfigOptions(s));
+        } catch (e) { zc.kill(); throw e; } // resume 失败/超时也杀子进程，防泄漏
+        break;
+      }
+
+      case 'session/prompt': {
+        const s = sessions.get(params?.sessionId);
+        if (!s) throw new Error(`unknown session: ${params?.sessionId}`);
+        const blocks = params?.prompt || [];
+        const textBlocks = blocks.filter(b => b?.type === 'text');
+        const firstText = (textBlocks[0]?.text || '').trim();
+        const compactMatch = COMPACT_ON ? COMPACT_RE.exec(firstText) : null;
+        if (compactMatch) {
+          // /compact 手动压缩：本地分派，不直通 zcode 烧普通 prompt
+          if (s.busy || s.turnWaiter) throw new Error('prompt already in flight');
+          s.busy = true;
+          try {
+            s.lastActivity = Date.now();
+            const zc = await ensureZcode(s);
+            const myTurn = ++s.turnSeq;
+            const instructions = (compactMatch[1] || '').trim();
+            const cparams = { sessionId: s.zsid };
+            if (instructions) cparams.instructions = instructions;
+            // 先置 compaction 态再发请求：result 与 turn 事件可能同一 chunk 到达，
+            // part.upserted(compaction) 的回调先于本协程恢复执行，晚了就捞不到富字段
+            s.compaction = { id: `zcode-compact-${++s.compactSeq}`, pre: undefined, post: undefined, summary: undefined };
+            try {
+              await zc.request('session/compact', cparams, 30000);
+            } catch (e) {
+              throw new Error(`session/compact failed: ${String(e?.message || e).slice(0, 200)}`);
+            }
+            emitCompactionCard(s, 'in_progress');
+            const done = await new Promise((resolve) => {
+              s.turnWaiter = { resolve, turn: myTurn };
+              // 压缩也是一轮 turn；同样的看门狗保险丝
+              s.turnWaiter.timer = setTimeout(() => {
+                if (s.turnWaiter?.turn === myTurn) {
+                  log('compact watchdog fired');
+                  if (s.compaction) emitCompactionCard(s, 'failed', 'compaction watchdog timeout');
+                  endTurn(s, 'end_turn');
+                }
+              }, 25 * 60 * 1000);
+            });
+            result = { stopReason: done.stopReason || 'end_turn' };
+          } finally { s.busy = false; s.compaction = null; }
+          break;
+        }
+        const text = textBlocks.map(b => b.text).join('\n');
+        if (!text) throw new Error('session/prompt: no text content');
+        // 忙闸在任何 await 之前同步落下：两个 prompt 交错进来时后到者直接被拒，不会互相覆盖 waiter
+        if (s.busy || s.turnWaiter) throw new Error('prompt already in flight');
+        s.busy = true;
+        try {
+          s.lastActivity = Date.now(); // 先记活跃再重建，防回收器在 ensureZcode 窗口开杀
+          const zc = await ensureZcode(s); // 子进程可能已被闲置回收：透明重建
+          const myTurn = ++s.turnSeq; // 代际令牌：看门狗只认自己这轮
+          try {
+            await zc.request('session/send', { sessionId: s.zsid, content: text }, 30000);
+          } catch (e) {
+            throw new Error(`session/send failed: ${String(e?.message || e).slice(0, 200)}`);
+          }
+          const done = await new Promise((resolve) => {
+            s.turnWaiter = { resolve, turn: myTurn };
+            // 保险丝：turn 结束事件万一丢失（协议升级等），25min 后收口避免宿主 prompt 永久挂起
+            s.turnWaiter.timer = setTimeout(() => {
+              if (s.turnWaiter?.turn === myTurn) { log('turn watchdog fired'); endTurn(s, 'end_turn'); }
+            }, 25 * 60 * 1000);
+          });
+          result = { stopReason: done.stopReason || 'end_turn' };
+        } finally { s.busy = false; }
+        break;
+      }
+
+      case 'session/set_mode': {
+        const s = sessions.get(params?.sessionId);
+        if (!s) throw new Error(`unknown session: ${params?.sessionId}`);
+        const mode = ZCODE_MODES.some(m => m.id === params?.modeId) ? params.modeId : null;
+        if (!mode) throw new Error(`unsupported mode: ${params?.modeId}`);
+        const zc = await ensureZcode(s);
+        await zc.request('session/setMode', { sessionId: s.zsid, mode }, 15000);
+        s.currentMode = mode;
+        result = {};
+        break;
+      }
+
+      case 'session/set_config_option': {
+        const s = sessions.get(params?.sessionId);
+        if (!s) throw new Error(`unknown session: ${params?.sessionId}`);
+        const configId = String(params?.configId || '');
+        // v1：select 的 value 是平铺裸字符串；boolean 才带 type:"boolean"（本桥不宣告 boolean 选项）
+        if (params?.type === 'boolean' || typeof params?.value === 'boolean') {
+          const err = new Error(`config option ${configId} does not accept boolean values`);
+          err.code = -32602;
+          throw err;
+        }
+        const value = typeof params?.value === 'string' ? params.value : String(params?.value ?? '');
+        if (!value) {
+          const err = new Error('config option value is required');
+          err.code = -32602;
+          throw err;
+        }
+        const zc = await ensureZcode(s);
+        // 串行闸：模型/思考深度连切时按到达顺序落盘，避免两笔 setModel/setThoughtLevel 交错
+        const run = s.opQueue.then(() => applyConfigOption(s, zc, configId, value));
+        s.opQueue = run.catch(() => {});
+        await run;
+        // 应答必须携带完整清单（SetSessionConfigOptionResponse）；宿主据此刷新选择器
+        result = { configOptions: buildConfigOptions(s) };
+        break;
+      }
+
+      case 'session/close': {
+        const s = sessions.get(params?.sessionId);
+        if (s) { s.closed = true; s.zc?.kill(); sessions.delete(params.sessionId); } // 回收后 s.zc 为 null：照样算关掉
+        result = {};
+        break;
+      }
+
+      case 'authenticate':
+        result = {};
+        break;
+
+      default:
+        throw { code: -32601, message: `Method not found: ${method}` };
+    }
+    acpSend({ id, result });
+    for (const fn of postResponse.splice(0)) {
+      try { await fn(); } catch (e) { log('post-response work failed', String(e).slice(0, 200)); }
+    }
+  } catch (e) {
+    const err = e && e.code ? { code: e.code, message: e.message } : { code: -32603, message: String(e?.message || e) };
+    log('ACP error', method, JSON.stringify(err));
+    acpSend({ id, error: err });
+  }
+}
+
+// ---------- ACP stdin 读取 ----------
+let inBuf = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (d) => {
+  inBuf += d;
+  let i;
+  while ((i = inBuf.indexOf('\n')) >= 0) {
+    const line = inBuf.slice(0, i); inBuf = inBuf.slice(i + 1);
+    if (!line.trim()) continue;
+    let m; try { m = JSON.parse(line); } catch (e) { log('ACP parse error', line.slice(0, 200)); continue; }
+    if (m.id !== undefined && m.method) {
+      handleAcpRequest(m.id, m.method, m.params); // 异步，不阻塞读取
+    } else if (m.method && m.id === undefined) {
+      if (m.method === 'session/cancel') {
+        const s = sessions.get(m.params?.sessionId);
+        if (s) {
+          // ACP 语义：被取消的 prompt 要尽快以 cancelled 收口（zcode 侧 stop 照发；子进程可能已被回收）
+          if (s.zc) s.zc.request('session/stop', { sessionId: s.zsid }, 10000).catch(e => log('cancel/stop failed', String(e)));
+          if (s.compaction) emitCompactionCard(s, 'failed', 'cancelled by user');
+          if (s.turnWaiter) endTurn(s, 'cancelled');
+        }
+      } else if (m.method === 'session/set_session_mode' || m.method === 'session/set_session_model') {
+        // 兼容个别客户端命名差异：忽略（MindFS 用标准名）
+      } else {
+        log('ACP notification (ignored)', m.method);
+      }
+    }
+  }
+});
+process.stdin.on('end', () => {
+  log('stdin end, killing children');
+  killAllChildren();
+  setTimeout(() => process.exit(0), 300);
+});
+// 宿主/系统停桥走 SIGTERM：Node 默认直接终止不跑 exit 钩子，必须自己收尸
+function killAllChildren() { for (const c of allChildren) { try { c.kill('SIGKILL'); } catch {} } }
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, () => { log('signal', sig, '— killing children and exiting'); killAllChildren(); setTimeout(() => process.exit(0), 300); });
+}
+process.on('exit', () => killAllChildren());
+process.on('uncaughtException', (e) => { log('uncaughtException', String(e?.stack || e)); });
+process.on('unhandledRejection', (e) => { log('unhandledRejection', String(e?.stack || e)); });
