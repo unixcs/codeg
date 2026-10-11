@@ -462,6 +462,17 @@ function handleZcodeNotification(m) {
       break;
     }
 
+    case 'session.updated': {
+      // zcode 3.14+ 的压缩事件走这条（而非 part.upserted）：载荷带 operationId/status 的
+      // 操作事件 + 带 boundaryId 的边界事件（pre/postCompactTokenCount）。
+      // 只补 compaction 卡的 token 元数据——生命周期卡仍由 turn.completed 驱动（统一时序）
+      if (s.compaction && Number.isFinite(p.preCompactTokenCount)) {
+        s.compaction.pre = p.preCompactTokenCount;
+        if (Number.isFinite(p.postCompactTokenCount)) s.compaction.post = p.postCompactTokenCount;
+      }
+      break;
+    }
+
     case 'part.upserted': {
       const part = p.part || {};
       if (part.type === 'tool') {
