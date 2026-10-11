@@ -14,7 +14,7 @@
 //   MOCK_RESUME_MESSAGES_FILE         session/resume 返回的 messages（文件 JSON）
 //   MOCK_SESSION_ID                   自定义会话 id（默认 sess_mock_1）
 
-import { appendFileSync, readFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 
 const ACTIONS = process.env.MOCK_ACTIONS_FILE || '';
 const SETTING_FILE = process.env.MOCK_SETTINGS_FILE || '';
@@ -92,6 +92,10 @@ function runTurn(kind, sid = lastSid) {
 
 let buf = '';
 process.stdin.setEncoding('utf8');
+// pid 文件：测试按路径精准杀本实例，替代 pgrep 散弹枪（pgrep 会误杀并行跑的其他测试文件的 mock）
+if (process.env.MOCK_PID_FILE) {
+  try { writeFileSync(process.env.MOCK_PID_FILE, String(process.pid)); } catch {}
+}
 process.stdin.on('end', () => process.exit(0)); // 防御：被当普通脚本跑时 stdin 关闭即退，不当孤儿
 process.stdin.on('data', (d) => {
   buf += d;

@@ -2,7 +2,8 @@
 // zcode-acp-bridge v0.2.0 协议层单测（node:test，mock zcode app-server）
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startBridge, initialize } from './harness.mjs';
 
@@ -80,8 +81,8 @@ test('session/new：预响应宣告 /compact 命令（name+description 必填）
     const r = await b.responseFor(2);
     const cmd = findUpdate(b, u => u.sessionUpdate === 'available_commands_update');
     assert.ok(cmd, 'available_commands_update pushed');
-    assert.equal(cmd.commands[0].name, 'compact');
-    assert.ok(cmd.commands[0].description && cmd.commands[0].description.length > 0, 'description required');
+    assert.equal(cmd.availableCommands[0].name, 'compact'); // ACP v1 必填字段名（"commands" 会被 codeg 静默丢帧）
+    assert.ok(cmd.availableCommands[0].description && cmd.availableCommands[0].description.length > 0, 'description required');
     assert.ok(r.result.sessionId);
   });
 });
@@ -435,17 +436,21 @@ test('stderr 纪律：全程不输出 code+message 形状行', async () => {
 });
 
 test('zcode 子进程被杀：在飞 prompt 以 end_turn 收口 + 提示 chunk', async () => {
-  await withBridge({ env: { MOCK_TURN_DELAY_MS: 100000 } }, async (b) => {
+  // pid 文件精准定位本桥 spawn 的 mock：pgrep -f 会误杀并行测试文件（murphy）的 mock 实例
+  const pidFile = join(tmpdir(), `mock-zcode-pid-${process.pid}-${Date.now()}`);
+  await withBridge({ env: { MOCK_TURN_DELAY_MS: 100000, MOCK_PID_FILE: pidFile } }, async (b) => {
     await initialize(b, 1);
     b.request(2, 'session/new', { cwd: '/tmp' });
     const sid = (await b.responseFor(2)).result.sessionId;
     b.request(3, 'session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'x' }] });
-    // 找到 mock 子进程（桥的子进程）杀掉：通过 actions 文件推断 —— 简化：杀桥进程组外的 mock
-    // 桥 spawn 的 mock 是桥的子进程；这里从 /proc 找 cmdline 含 mock-zcode-server 的进程
-    const { execSync } = await import('node:child_process');
-    const pids = execSync(`pgrep -f "mock-zcode-server.mjs" || true`).toString().trim().split('\n').filter(Boolean);
-    assert.ok(pids.length >= 1, 'mock process found');
-    for (const pid of pids) { try { process.kill(Number(pid), 'SIGKILL'); } catch {} }
+    // 等 send 真正到达 mock（turn 在飞）再杀：杀早了会被透明 respawn 接管，测不到"子进程死亡收口"路径
+    for (let i = 0; i < 200; i++) {
+      if ((await b.actions()).some(a => a.method === 'session/send')) break;
+      await new Promise(r => setTimeout(r, 25));
+    }
+    const pid = Number(readFileSync(pidFile, 'utf8').trim());
+    assert.ok(pid > 0, 'valid pid');
+    try { process.kill(pid, 'SIGKILL'); } catch {}
     const r = await b.responseFor(3);
     assert.equal(r.result.stopReason, 'end_turn');
     const chunk = findUpdate(b, u => u.sessionUpdate === 'agent_message_chunk' && /进程退出/.test(u.content?.text || ''));
