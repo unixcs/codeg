@@ -34,14 +34,14 @@ test('--version 探针不挂 stdio', async () => {
   const out = await new Promise((resolve, reject) => {
     execFile('node', [bridgePath, '--version'], (e, stdout) => e ? reject(e) : resolve(stdout));
   });
-  assert.match(out, /zcode-acp-bridge 0\.4\.1/);
+  assert.match(out, /zcode-acp-bridge 0\.4\.2/);
 });
 
 test('initialize 应答 v1 能力与版本', async () => {
   await withBridge({}, async (b) => {
     const r = await initialize(b, 1);
     assert.equal(r.result.protocolVersion, 1);
-    assert.equal(r.result.agentInfo.version, '0.4.1');
+    assert.equal(r.result.agentInfo.version, '0.4.2');
     assert.equal(r.result.agentCapabilities.loadSession, true);
   });
 });

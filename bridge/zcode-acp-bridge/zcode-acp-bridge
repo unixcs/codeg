@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // zcode-acp-bridge — ACP (Agent Client Protocol) agent ⇄ ZCode Protocol (zcode app-server --stdio) 适配器
-// v0.4.1（load/resume 响应内嵌 configOptions，commands 通知挪到响应后）。历史：v0.4.0。v0.1 是最小消息直通桥；v0.2 对齐 codeg 0.35.x 的 config option 机制并补齐 /compact；
+// v0.4.2（load/resume 识别 codeg 建立期 _meta.zcodeBridge 提示，仅诊断日志）。前版：v0.4.1（load/resume 响应内嵌 configOptions，commands 通知挪到响应后）。历史：v0.4.0。v0.1 是最小消息直通桥；v0.2 对齐 codeg 0.35.x 的 config option 机制并补齐 /compact；
 // v0.3 吸收两轮对抗审查的加固：inputId turn 精确归属、spawn 全局并发闸、跨 workspace 归属校验、
 // 看门狗补发 session/stop、日志 0600/redact 扩展、权限选项 kind 白名单、backlog/背压保险丝；
 // v0.4 吸收 R7/R8 两轮审查 + 真机（zcode 3.14.3）探针实证：interaction/requestPermission 直答、
@@ -82,7 +82,7 @@ import { join } from 'node:path';
 
 // 版本探测：ACP 宿主（Codeg 等）preflight 会跑 `agent --version`；不处理会挂在 stdio 等输入
 if (process.argv.some(a => a === '--version' || a === '-V' || a === '-v')) {
-  console.log('zcode-acp-bridge 0.4.1');
+  console.log('zcode-acp-bridge 0.4.2');
   process.exit(0);
 }
 
@@ -1296,7 +1296,7 @@ async function handleAcpRequest(id, method, params) {
             promptCapabilities: { audio: false, embeddedContext: false, image: false },
             sessionCapabilities: { close: {}, resume: {} },
           },
-          agentInfo: { name: 'zcode-acp-bridge', version: '0.4.1' },
+          agentInfo: { name: 'zcode-acp-bridge', version: '0.4.2' },
           authMethods: [],
         };
         break;
@@ -1322,6 +1322,10 @@ async function handleAcpRequest(id, method, params) {
 
       case 'session/load': {
         const cwd = params?.cwd || process.cwd();
+        // codeg 0.35.x load 建立期 drain 只转发响应后的 update；_meta.zcodeBridge.establishPhase
+        // 是宿主发来的建立期提示（codeg 侧 patch 起传），用于确认响应内嵌通道生效（诊断用）
+        const establishPhase = Boolean(params?.meta?.zcodeBridge?.establishPhase);
+        log('session/load', { establishPhase });
         const zsid = params?.sessionId;
         if (!zsid) throw new Error('session/load: missing sessionId');
         assertCwd(cwd);
@@ -1387,6 +1391,8 @@ async function handleAcpRequest(id, method, params) {
       // ACP session/resume（老宿主重启后走这条）：不回放消息——zcode app-server 原生记得全部上下文
       case 'session/resume': {
         const cwd = params?.cwd || process.cwd();
+        const establishPhase = Boolean(params?.meta?.zcodeBridge?.establishPhase);
+        log('session/resume', { establishPhase });
         const zsid = params?.sessionId;
         if (!zsid) throw new Error('session/resume: missing sessionId');
         assertCwd(cwd);
