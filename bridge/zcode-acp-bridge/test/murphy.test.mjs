@@ -293,3 +293,122 @@ test('spawn 并发闸：12 并发 session/new → 8 成功 + 4 拒绝(-32603)', 
     assert.equal(new Set(ok.map(r => r.result.sessionId)).size, 8, 'distinct session ids');
   });
 });
+
+// ---- R7/R8 吸收批：load 单飞 / legacy 兜底缓冲 / -32010 重试 / 僵尸权限归属 / 日志卫生 ----
+
+test('并发 load 同一 zsid：单飞只 spawn 一次，两个响应都成功', async () => {
+  // R7-B1：并发窗口内两个 load 都见不到已入册条目——不加单飞会双 spawn 双回放，
+  // 后入册者覆盖前者且其子进程成孤儿
+  await withBridge({ env: { MOCK_RESUME_DELAY_MS: 400 } }, async (b) => {
+    await initialize(b, 1);
+    b.request(2, 'session/load', { cwd: '/tmp', sessionId: 'sess_mock_1' });
+    b.request(3, 'session/load', { cwd: '/tmp', sessionId: 'sess_mock_1' });
+    const [r2, r3] = await Promise.all([b.responseFor(2), b.responseFor(3)]);
+    assert.ok(r2.result?.models && r3.result?.models, 'both loads succeed');
+    const resumes = (await b.actions()).filter(a => a.method === 'session/resume');
+    assert.equal(resumes.length, 1, `single-flight: exactly one spawn/resume, got ${resumes.length}`);
+    // 桥仍可用
+    b.request(4, 'session/prompt', { sessionId: 'sess_mock_1', prompt: [{ type: 'text', text: 'after concurrent load' }] });
+    assert.equal((await b.responseFor(4)).result.stopReason, 'end_turn');
+  });
+});
+
+test('legacy zcode（事件无 inputId）的 already_running 同 chunk：缓冲重放快速收口', async () => {
+  // R7-M1：旧 zcode 终结事件不带 inputId，pendingTurnOp 窗口内到达的无主终结此前被吞，
+  // 跟随轮挂到看门狗。现在缓存为 foreign 候选，already_running 响应后重放收口
+  await withBridge({
+    env: { MOCK_TURN_DELAY_MS: 1500, MOCK_COMPACT_END_BEFORE_RESPONSE: '1', MOCK_LEGACY_NO_INPUTID: '1' },
+  }, async (b) => {
+    await initialize(b, 1);
+    b.request(2, 'session/new', { cwd: '/tmp' });
+    const sid = (await b.responseFor(2)).result.sessionId;
+    b.request(3, 'session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '/compact' }] });
+    await b.waitFor(m => m.method === 'session/update' && m.params?.update?.sessionUpdate === 'compaction_update' && m.params?.update?.status === 'in_progress', 5000, 'first compact in_progress');
+    b.notify('session/cancel', { sessionId: sid });
+    assert.equal((await b.responseFor(3)).result.stopReason, 'cancelled');
+    const t0 = Date.now();
+    b.request(4, 'session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: '/compact again' }] });
+    const r4 = await b.responseFor(4, 10000);
+    assert.ok(Date.now() - t0 < 8000, `legacy follow-mode resolved fast (took ${Date.now() - t0}ms)`);
+    assert.equal(r4.result.stopReason, 'end_turn');
+    const cards = b.stdout.filter(m => m.method === 'session/update' && m.params?.update?.sessionUpdate === 'compaction_update').map(m => m.params.update.status);
+    assert.ok(cards.includes('completed'), `completed card present: ${cards.join(',')}`);
+  });
+});
+
+test('send 撞 -32010（上一轮终结未落）：短退避重试后成功', async () => {
+  // R7-M3：紧邻 cancel 重发时真实 zcode 会拒 -32010 数百 ms——必须重试而不是直接报错
+  await withBridge({ env: { MOCK_32010_CONCURRENT: '1', MOCK_TURN_DELAY_MS: 300 } }, async (b) => {
+    await initialize(b, 1);
+    b.request(2, 'session/new', { cwd: '/tmp' });
+    const sid = (await b.responseFor(2)).result.sessionId;
+    b.request(3, 'session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'first' }] });
+    await b.waitFor(m => m.method === 'session/update' && m.params?.update?.sessionUpdate === 'agent_message_chunk', 5000, 'first chunk');
+    b.notify('session/cancel', { sessionId: sid });
+    assert.equal((await b.responseFor(3)).result.stopReason, 'cancelled');
+    // 立即重发：上一 turn 还没终结 → mock 拒 -32010 → 桥退避重试 → 成功
+    b.request(4, 'session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'retry wins' }] });
+    assert.equal((await b.responseFor(4, 10000)).result.stopReason, 'end_turn');
+    const sends = (await b.actions()).filter(a => a.method === 'session/send');
+    assert.ok(sends.length >= 2, `retry happened (>=2 sends): ${sends.length}`);
+    assert.equal(sends[sends.length - 1].params.content, 'retry wins');
+  });
+});
+
+test('僵尸轮权限止损归属：外来轮只拒交互不动会话，健康轮不受牵连', async () => {
+  // R7-M2：turn1 的权限无从归属（无工具卡）→ 止损 refusal（保底行为不变）；
+  // turn2 先有工具卡 → 僵尸权限（tc_zombie）判外来轮 → 只应答 deny，不 session/stop 不 endTurn
+  await withBridge({ env: { MOCK_ZOMBIE_PERM: '1', MOCK_TURN_DELAY_MS: 200 } }, async (b) => {
+    await initialize(b, 1);
+    b.request(2, 'session/new', { cwd: '/tmp' });
+    const sid = (await b.responseFor(2)).result.sessionId;
+    b.request(3, 'session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'first' }] });
+    assert.equal((await b.responseFor(3)).result.stopReason, 'refusal', 'unattributable permission still stops its own turn');
+    b.request(4, 'session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'second' }] });
+    assert.equal((await b.responseFor(4, 10000)).result.stopReason, 'end_turn', 'healthy turn survives zombie permission');
+    const stops = (await b.actions()).filter(a => a.method === 'session/stop');
+    assert.equal(stops.length, 1, `exactly one stop-loss stop (turn1), got ${stops.length}`);
+  });
+});
+
+test('畸形 ACP 行含密钥形态：日志只记长度+hex 头，不落原文', async () => {
+  // R8-M1：ACP parse error 是桥唯一落"宿主原文"的汇点——必须只记 len + 首 16 字节 hex
+  const b = await startBridge({});
+  try {
+    await initialize(b, 1);
+    // 绕过 b.raw（它会 JSON.stringify 整个字符串——畸形行会变合法字面量）：直接写 stdin
+    b.proc.stdin.write('{"broken": "AIzaSyD-123456789012345678901234567890abc"} no trailing\n');
+    await sleep(300);
+    const logFile = join(b.logDir, `bridge-${b.proc.pid}.log`);
+    const content = readFileSync(logFile, 'utf8');
+    assert.ok(content.includes('ACP parse error'), 'parse error logged');
+    assert.ok(!content.includes('AIza'), 'no plaintext key material in log');
+    assert.ok(!content.includes('"broken"'), 'no raw line content in log');
+  } finally {
+    await b.close();
+  }
+});
+
+test('turn.failed 收口：失败消息透出、会话可继续', async () => {
+  // R7 指出的测试盲区：mock 此前无 turn.failed 路径。失败轮要正常释放 waiter
+  //（stopReason end_turn）+ 消息块带失败原因，且不污染下一轮（sawText 水位归零）
+  await withBridge({ env: { MOCK_FAIL_TURN: '2', MOCK_TURN_DELAY_MS: 50 } }, async (b) => {
+    await initialize(b, 1);
+    b.request(2, 'session/new', { cwd: '/tmp' });
+    const sid = (await b.responseFor(2)).result.sessionId;
+    b.request(3, 'session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'ok turn' }] });
+    assert.equal((await b.responseFor(3)).result.stopReason, 'end_turn');
+    b.request(4, 'session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'doomed turn' }] });
+    assert.equal((await b.responseFor(4)).result.stopReason, 'end_turn');
+    const failedChunk = b.stdout.find(m => m.method === 'session/update'
+      && m.params?.update?.sessionUpdate === 'agent_message_chunk'
+      && String(m.params?.update?.content?.text || '').includes('mock turn failure'));
+    assert.ok(failedChunk, 'failure reason surfaced as message chunk');
+    // 下一轮正常：failed 分支的水位归零没有把旧前缀兜底重放
+    b.request(5, 'session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'after failure' }] });
+    assert.equal((await b.responseFor(5)).result.stopReason, 'end_turn');
+    const chunks = b.stdout.filter(m => m.method === 'session/update' && m.params?.update?.sessionUpdate === 'agent_message_chunk')
+      .map(m => m.params.update.content.text).join('|');
+    assert.ok(!chunks.includes('echo:okecho:'), `no duplicated prefix replay: ${chunks.slice(0, 120)}`);
+  });
+});

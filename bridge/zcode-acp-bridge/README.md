@@ -73,8 +73,9 @@ zcode `session/compact`（异步 turn），以 `compaction_update` 卡片回报 
 - 日志写文件（默认系统临时目录 `mkdtemp`，0700/0600），**stderr 保持安静**（部分宿主会据 stderr
   的 `"code"+\"message\"` 形状行取消在飞 prompt）。
 - 记录：生命周期事件、zcode stderr、错误摘要——均经 `redact()`（`sk-`/`Bearer`/`api_key`/
-  `Authorization` 等形态脱敏 + 单行化）。
+  `Authorization`/`AIza`/`github_pat_`/`xox*`/AWS secret 等形态脱敏 + 单行化）。
 - **不记录**：prompt 与回复正文；事件只留元数据（turnNumber/toolCallId/toolName/tokens 等字段名与计数）。
+  畸形入站行只记长度 + 首 16 字节 hex（不落原文）。
 
 ## 规范偏离声明
 
@@ -89,9 +90,11 @@ ACP session-compaction RFD 要求宿主宣告 `clientCapabilities.session.compac
 npm test        # node --test test/bridge.test.mjs test/murphy.test.mjs
 ```
 
-45 个用例：协议形状、config option 全链路、/compact 生命周期、以及墨菲定律组
+50 个用例：协议形状、config option 全链路、/compact 生命周期、以及墨菲定律组
 （1MB prompt、同 chunk 竞态、SEP 注入、并发建会话、宿主 stdin 断开、v0.1 兼容档、
-already_running 跟随竞态、cancel 重建窗口、spawn 并发闸、close×respawn 孤儿收尸等）。
+already_running 跟随竞态、cancel 重建窗口、spawn 并发闸、close×respawn 孤儿收尸、
+并发 load 单飞、legacy 无 inputId 兜底、-32010 重试、僵尸轮权限归属、turn.failed 收口、
+日志脱敏等）。
 测试用 mock zcode（`test/mock-zcode-server.mjs`），行为由 `MOCK_*` 环境变量驱动。
 
 ## v0.3 健壮性设计要点
@@ -110,3 +113,24 @@ already_running 跟随竞态、cancel 重建窗口、spawn 并发闸、close×re
   跨 workspace 挂会话；set_config_option 串行 + 积压上限（32）。
 - **日志安全**：日志目录 0700、文件 0600（轮转后 chmod 兜底）；redact 覆盖 sk-/Bearer/
   Authorization/api_key/token/AKIA/ghp_/JWT/cookie 等形态；stderr 静默（防宿主误判）。
+
+## v0.4 健壮性设计要点（R7/R8 对抗审查吸收 + 真机 zcode 3.14.3 探针实证）
+
+- **权限交互直答**：zcode 3.14+ 的权限是双向竞速（`interaction/requestPermission` 请求应答 vs
+  `v4/command resolveInteraction`，先到先得）。桥此前对反向请求一律 -32601，错误应答会让交互
+  立即判 failed（真机实测 `permission.resolved decision=deny`）——现在直接应答请求（allow 档回
+  `allow`，deny 档回 `deny`），事件侧 resolveInteraction 保留作幂等兜底。
+- **权限止损归属**：权限 payload 无 inputId；用 `toolCallId ∈ seenToolCalls` 作证（真机实测
+  工具卡事件先于权限请求到达）。僵尸轮补发的权限只拒绝该交互，不做会话级 stop / 不误收当前轮。
+- **并发 load/resume 单飞**：同一 zsid 并发 load 只 spawn 一次、只回放一次；入册前 kill 同 id
+  旧条目子进程；close 与在飞 load/resume 竞速时完成后不入册直接收尸。
+- **-32010 短退避重试**：紧邻 cancel/看门狗收口后立刻重发，真实 zcode 会以 -32010 拒绝
+  （上一轮终结未落数百 ms）——send/compact 各重试 2 次（400/800ms）；最终失败且错误码为
+  -32010 时不把从未开跑的 inputId 转 foreign 追踪。
+- **legacy 兜底缓冲**：旧 zcode（事件无 inputId）的 already_running 同 chunk 竞态——
+  pendingTurnOp 窗口内到达的无主终结缓存为 foreign 候选，响应处理后重放收口。
+- **inputId 进程级单调**：close→load 复用 sessionId 也不撞号；带 inputId 且无主的中间事件
+  丢弃（防僵尸流污染 UI）、不刷新闲置回收计时。
+- **行为增量声明**：`assertCwd`（v0.4 起 cwd 必须是可访问目录，否则 -32602；v0.1 对失效路径
+  照常建会话）。workspaceKey 编码 v0.1→v0.3 有分叉，但真机实测 zcode resume 不校验 key
+  与创建时一致，无实际影响。

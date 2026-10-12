@@ -14,6 +14,11 @@
 //   MOCK_RESUME_DELAY_MS=N            session/resume 延迟（测 respawn 并发/close 竞态窗口）
 //   MOCK_COMPACT_END_BEFORE_RESPONSE=1  already_running 时把在飞压缩的 turn.completed 先于响应写出
 //                                       （同 chunk 保序——复刻 R5-M1 竞态）
+//   MOCK_32010_CONCURRENT=1           turn 在飞时 session/send 拒 -32010（真实 zcode 并发语义，测重试）
+//   MOCK_FAIL_TURN=N                  第 N 个 turn 以 turn.failed 收口（error.message=mock turn failure）
+//   MOCK_LEGACY_NO_INPUTID=1          所有事件剥离 inputId（模拟旧 zcode，测兜底路径）
+//   MOCK_ZOMBIE_PERM=1                每个普通 turn 里发无匹配选项的 permission.requested（测止损归属：
+//                                     第 1 个 turn 前无工具卡→止损 refusal；第 2 个起先发工具卡→外来轮跳过）
 //   MOCK_RESUME_MESSAGES_FILE         session/resume 返回的 messages（文件 JSON）
 //   MOCK_SESSION_ID                   自定义会话 id（默认 sess_mock_1）
 
@@ -53,6 +58,10 @@ const TURN_DELAY = parseInt(process.env.MOCK_TURN_DELAY_MS || '15', 10);
 const CREATE_DELAY = parseInt(process.env.MOCK_CREATE_DELAY_MS || '0', 10);
 const RESUME_DELAY = parseInt(process.env.MOCK_RESUME_DELAY_MS || '0', 10);
 const COMPACT_END_FIRST = process.env.MOCK_COMPACT_END_BEFORE_RESPONSE === '1';
+const REJECT_32010 = process.env.MOCK_32010_CONCURRENT === '1';
+const FAIL_TURN = parseInt(process.env.MOCK_FAIL_TURN || '0', 10);
+const LEGACY_NO_INPUTID = process.env.MOCK_LEGACY_NO_INPUTID === '1';
+const ZOMBIE_PERM = process.env.MOCK_ZOMBIE_PERM === '1';
 const SID_PREFIX = process.env.MOCK_SESSION_ID || 'sess_mock_1';
 const SID_SEQ = process.env.MOCK_SESSION_ID_SEQ === '1'; // 1：每个 create 递增新 sessionId（并发会话场景）
 let sidCounter = 0;
@@ -74,12 +83,18 @@ function record(method, params) {
   try { appendFileSync(ACTIONS, JSON.stringify({ method, params }) + '\n'); } catch {}
 }
 function ev(type, payload, sid = lastSid) {
-  send({ method: 'session/event', params: { type, payload, seq: ++seq, sessionId: sid, eventId: `e${seq}`, deliveryKind: 'desktop-continuous' } });
+  const p2 = { ...payload };
+  if (LEGACY_NO_INPUTID) delete p2.inputId; // 旧 zcode 模式：事件不带 inputId
+  send({ method: 'session/event', params: { type, payload: p2, seq: ++seq, sessionId: sid, eventId: `e${seq}`, deliveryKind: 'desktop-continuous' } });
 }
 // 在飞压缩登记：accepted 后、终结事件前非空（真实 zcode 的 already_running 判据）
 let compactInFlight = null; // { sid, inputId, turn }
+let promptTurn = null;      // 在飞普通 turn：MOCK_32010_CONCURRENT 下 send 拒 -32010 的判据
+let turnCounter = 0;
 function runTurn(kind, sid = lastSid, inputId) {
   const turn = { ended: false };
+  const myTurnNum = ++turnCounter;
+  if (kind !== 'compact') promptTurn = turn;
   ev('turn.started', { turnNumber: 1, ...(inputId ? { inputId } : {}) }, sid);
   if (NOISE) {
     ev('future.event.type', { something: true }, sid);   // 未来版本新词：桥必须忽略
@@ -90,10 +105,16 @@ function runTurn(kind, sid = lastSid, inputId) {
     ev('part.upserted', { part: { messageId: 'm1', partId: 'p1', sessionId: sid, type: 'compaction', preTokens: 12000, postTokens: 3000 } }, sid);
   }
   if (kind === 'compact' && STICKY_PERM) {
-    ev('permission.requested', { requestId: 'perm_1', toolCallId: 't1', toolName: 'bash', reason: 'test', riskLevel: 'low', input: {}, options: [{ optionId: 'opt_allow', label: 'Allow', kind: 'allowOnce' }] }, sid);
+    ev('permission.requested', { requestId: 'perm_1', toolCallId: 't1', toolName: 'bash', reason: 'test', riskLevel: 'low', input: {}, options: [{ optionId: 'opt_allow', label: 'Allow', kind: 'allow_once' }] }, sid);
     return turn; // 收口交给 permission 应答后的 turn.completed
   }
   if (kind !== 'compact') ev('part.delta', { messageId: 'm1', partId: 'p1', field: 'text', delta: 'echo:' }, sid);
+  if (kind !== 'compact' && ZOMBIE_PERM) {
+    // 止损归属编排：turn 1 无工具卡（seenToolCalls 空）→ 无从归属 → 止损 refusal；
+    // turn 2 起先发工具卡 tc_t2（桥入册 seenToolCalls）→ 僵尸权限 tc_zombie 判外来轮 → 跳过
+    if (myTurnNum >= 2) ev('tool.updated', { toolCallId: 'tc_t2', toolName: 'Bash', kind: 'started' }, sid);
+    ev('permission.requested', { requestId: `perm_zombie_${myTurnNum}`, toolCallId: 'tc_zombie', toolName: 'bash', reason: 'zombie', riskLevel: 'low', input: {}, options: [{ optionId: 'opt_interact', kind: 'interact', name: 'interact' }] }, sid);
+  }
   const completed = {
     ...(inputId ? { inputId } : {}),
     ...(BARE_COMPLETED ? {} : { response: kind === 'compact' ? 'compaction summary text' : 'echo:ok', tokenCount: 3, toolCallCount: 0, duration: 5 }),
@@ -101,6 +122,11 @@ function runTurn(kind, sid = lastSid, inputId) {
   setTimeout(() => {
     if (turn.ended) return; // 已被 END_FIRST 等路径提前收口
     turn.ended = true;
+    if (kind !== 'compact') promptTurn = null;
+    if (kind !== 'compact' && FAIL_TURN && myTurnNum === FAIL_TURN) {
+      ev('turn.failed', { ...(inputId ? { inputId } : {}), error: { message: 'mock turn failure' } }, sid);
+      return;
+    }
     ev('turn.completed', completed, sid);
     if (compactInFlight && compactInFlight.turn === turn) compactInFlight = null;
   }, TURN_DELAY);
@@ -171,6 +197,11 @@ function handle(m) {
       return;
     case 'session/send':
       if (p.sessionId !== lastSid) { send({ id: m.id, error: { code: -32602, message: 'unknown session' } }); return; }
+      if (REJECT_32010 && promptTurn && !promptTurn.ended) {
+        // 真实 zcode 并发语义：上一 turn 未终结时 send 被拒（R7-M3 场景——紧邻 cancel 重发）
+        send({ id: m.id, error: { code: -32010, message: 'A prompt is already running for this session' } });
+        return;
+      }
       send({ id: m.id, result: { accepted: true, sessionId: p.sessionId, stateRevision: 1 } });
       runTurn('prompt', p.sessionId, p.inputId);
       return;
