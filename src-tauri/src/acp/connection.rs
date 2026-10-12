@@ -5146,7 +5146,7 @@ fn build_resume_session_request(
     mcp_servers: Vec<McpServer>,
 ) -> ResumeSessionRequest {
     let mut req = ResumeSessionRequest::new(session_id, cwd.to_path_buf());
-    if let Some(meta) = claude_raw_sdk_session_meta(agent_type) {
+    if let Some(meta) = claude_raw_sdk_session_meta(agent_type).or_else(|| zcode_bridge_load_meta(agent_type)) {
         req = req.meta(meta);
     }
     if !mcp_servers.is_empty() {
