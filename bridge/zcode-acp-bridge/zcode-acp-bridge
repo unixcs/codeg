@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // zcode-acp-bridge — ACP (Agent Client Protocol) agent ⇄ ZCode Protocol (zcode app-server --stdio) 适配器
-// v0.4.0。v0.1 是最小消息直通桥；v0.2 对齐 codeg 0.35.x 的 config option 机制并补齐 /compact；
+// v0.4.1（load/resume 响应内嵌 configOptions，commands 通知挪到响应后）。历史：v0.4.0。v0.1 是最小消息直通桥；v0.2 对齐 codeg 0.35.x 的 config option 机制并补齐 /compact；
 // v0.3 吸收两轮对抗审查的加固：inputId turn 精确归属、spawn 全局并发闸、跨 workspace 归属校验、
 // 看门狗补发 session/stop、日志 0600/redact 扩展、权限选项 kind 白名单、backlog/背压保险丝；
 // v0.4 吸收 R7/R8 两轮审查 + 真机（zcode 3.14.3）探针实证：interaction/requestPermission 直答、
@@ -82,7 +82,7 @@ import { join } from 'node:path';
 
 // 版本探测：ACP 宿主（Codeg 等）preflight 会跑 `agent --version`；不处理会挂在 stdio 等输入
 if (process.argv.some(a => a === '--version' || a === '-V' || a === '-v')) {
-  console.log('zcode-acp-bridge 0.4.0');
+  console.log('zcode-acp-bridge 0.4.1');
   process.exit(0);
 }
 
@@ -1296,7 +1296,7 @@ async function handleAcpRequest(id, method, params) {
             promptCapabilities: { audio: false, embeddedContext: false, image: false },
             sessionCapabilities: { close: {}, resume: {} },
           },
-          agentInfo: { name: 'zcode-acp-bridge', version: '0.4.0' },
+          agentInfo: { name: 'zcode-acp-bridge', version: '0.4.1' },
           authMethods: [],
         };
         break;
@@ -1345,13 +1345,13 @@ async function handleAcpRequest(id, method, params) {
           const rr0 = await zc0.request('session/resume', { sessionId: zsid }, 20000);
           replayHistory(s0, zsid, rr0.result?.messages || []);
           await finishResumedSession(zc0, zsid, s0);
-          result = { models: acpModelsBlock(s0), modes: acpModesBlock(s0) };
+          result = { models: acpModelsBlock(s0), modes: acpModesBlock(s0), ...(CONFIG_OPTIONS_ON ? { configOptions: buildConfigOptions(s0) } : {}) };
           postResponse.push(() => pushConfigOptions(s0));
           break;
         }
         if (resumeInFlight.has(zsid)) { // 并发 load 同 zsid：等第一个的 spawn+回放完成，共用其结果（R7-B1）
           const s2 = await resumeInFlight.get(zsid);
-          result = { models: acpModelsBlock(s2), modes: acpModesBlock(s2) };
+          result = { models: acpModelsBlock(s2), modes: acpModesBlock(s2), ...(CONFIG_OPTIONS_ON ? { configOptions: buildConfigOptions(s2) } : {}) };
           postResponse.push(() => pushConfigOptions(s2));
           break;
         }
@@ -1376,8 +1376,8 @@ async function handleAcpRequest(id, method, params) {
         if (prevL) prevL.zc?.kill();
         sessions.set(zsid, s);
         sessionCwds.set(zsid, cwd);
-        result = { models: acpModelsBlock(s), modes: acpModesBlock(s) };
-        pushAdvertisedCommands(zsid);
+        result = { models: acpModelsBlock(s), modes: acpModesBlock(s), ...(CONFIG_OPTIONS_ON ? { configOptions: buildConfigOptions(s) } : {}) };
+        postResponse.push(() => pushAdvertisedCommands(zsid)); // 必须晚于 response 帧：codeg load/resume 建立期 drain 窗口只转发响应后到达的 update
         postResponse.push(() => pushConfigOptions(s)); // load 无建立期偏好回放通道：响应后重推（无 set 语义竞态）
         break;
       }
@@ -1403,13 +1403,13 @@ async function handleAcpRequest(id, method, params) {
           }
           const zc0 = await ensureZcode(s0);
           await finishResumedSession(zc0, zsid, s0);
-          result = { models: acpModelsBlock(s0), modes: acpModesBlock(s0) };
+          result = { models: acpModelsBlock(s0), modes: acpModesBlock(s0), ...(CONFIG_OPTIONS_ON ? { configOptions: buildConfigOptions(s0) } : {}) };
           postResponse.push(() => pushConfigOptions(s0));
           break;
         }
         if (resumeInFlight.has(zsid)) { // 并发 resume/load 同 zsid：等第一个的 spawn 完成，共用其结果（R7-B1）
           const s2 = await resumeInFlight.get(zsid);
-          result = { models: acpModelsBlock(s2), modes: acpModesBlock(s2) };
+          result = { models: acpModelsBlock(s2), modes: acpModesBlock(s2), ...(CONFIG_OPTIONS_ON ? { configOptions: buildConfigOptions(s2) } : {}) };
           postResponse.push(() => pushConfigOptions(s2));
           break;
         }
@@ -1431,8 +1431,8 @@ async function handleAcpRequest(id, method, params) {
         if (prevR) prevR.zc?.kill();
         sessions.set(zsid, s);
         sessionCwds.set(zsid, cwd);
-        result = { models: acpModelsBlock(s), modes: acpModesBlock(s) };
-        pushAdvertisedCommands(zsid);
+        result = { models: acpModelsBlock(s), modes: acpModesBlock(s), ...(CONFIG_OPTIONS_ON ? { configOptions: buildConfigOptions(s) } : {}) };
+        postResponse.push(() => pushAdvertisedCommands(zsid)); // 必须晚于 response 帧：codeg load/resume 建立期 drain 窗口只转发响应后到达的 update
         postResponse.push(() => pushConfigOptions(s));
         break;
       }

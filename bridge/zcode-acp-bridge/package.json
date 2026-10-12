@@ -1,6 +1,6 @@
 {
   "name": "zcode-acp-bridge",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "ACP (Agent Client Protocol) agent ⇄ ZCode Protocol (zcode app-server --stdio) adapter — adds model & thought-level config options, /compact and advertised commands for Codeg/MindFS hosts",
   "license": "MIT",
   "type": "module",
