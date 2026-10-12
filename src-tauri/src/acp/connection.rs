@@ -4674,6 +4674,26 @@ fn resolve_working_dir(working_dir: Option<&str>) -> PathBuf {
     }
 }
 
+/// ZCode 桥（custom:zcode-bridge）建立期提示：经 session/load 请求的 _meta 传给桥，
+/// 让它在 load 响应里内嵌 configOptions / availableCommands——否则 UI 重连后
+/// 模型选择器与 /compact 斜杠命令为空（桥 v0.4.1 起支持）。
+fn zcode_bridge_load_meta(agent_type: AgentType) -> Option<serde_json::Map<String, serde_json::Value>> {
+    if agent_type != AgentType::Custom("zcode-bridge".into()) {
+        return None;
+    }
+    let mut bridge = serde_json::Map::new();
+    bridge.insert(
+        "establishPhase".to_string(),
+        serde_json::Value::Bool(true),
+    );
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "zcodeBridge".to_string(),
+        serde_json::Value::Object(bridge),
+    );
+    Some(meta)
+}
+
 fn claude_raw_sdk_session_meta(
     agent_type: AgentType,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
@@ -5105,7 +5125,7 @@ fn build_load_session_request(
     mcp_servers: Vec<McpServer>,
 ) -> LoadSessionRequest {
     let mut req = LoadSessionRequest::new(session_id, cwd.to_path_buf());
-    if let Some(meta) = claude_raw_sdk_session_meta(agent_type) {
+    if let Some(meta) = claude_raw_sdk_session_meta(agent_type).or_else(|| zcode_bridge_load_meta(agent_type)) {
         req = req.meta(meta);
     }
     if !mcp_servers.is_empty() {
