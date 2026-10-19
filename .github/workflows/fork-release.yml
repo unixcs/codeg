@@ -142,6 +142,41 @@ jobs:
         with:
           workspaces: src-tauri
 
+      - name: Stamp fork version into build inputs
+        # CARGO_PKG_VERSION 是编译期烙进二进制的（update.rs 的 currentVersion），
+        # 只在 latest.json 写版本号会让已装机器永远看到"有更新"。必须在
+        # cargo/pnpm 构建前把 forkver 写进三处版本源，二进制才真正自称新版本。
+        # Cargo.lock 同步改，避免 --frozen-lockfile / lock 校验失败。
+        if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
+        env:
+          VER: ${{ steps.forkver.outputs.forkver }}
+        run: |
+          set -euo pipefail
+          sed -i "0,/^version = \".*\"/s//version = \"${VER}\"/" src-tauri/Cargo.toml
+          grep -q "^version = \"${VER}\"" src-tauri/Cargo.toml
+          python3 - "$VER" <<'EOF'
+          import json, sys
+          ver = sys.argv[1]
+          # Cargo.lock: bump the fork's own package entry — it's the only
+          # [[package]] named "codeg" (other crates carry a vendor prefix).
+          lines = open("src-tauri/Cargo.lock").read().split("\n")
+          hits = [i for i, line in enumerate(lines) if line == 'name = "codeg"']
+          assert len(hits) == 1, f'expected exactly one "codeg" entry, found {len(hits)}'
+          i = hits[0]
+          assert lines[i + 1].startswith("version = "), f"unexpected lock layout at line {i}"
+          lines[i + 1] = f'version = "{ver}"'
+          open("src-tauri/Cargo.lock", "w").write("\n".join(lines))
+          for path in ("src-tauri/tauri.conf.json", "package.json"):
+              text = open(path).read()
+              needle = '"version": "0.38.0"'
+              assert text.count(needle) == 1, f"expected one version field in {path}"
+              # spot replace keeps upstream's compact formatting intact
+              open(path, "w").write(text.replace(needle, f'"version": "{ver}"'))
+          EOF
+          grep "\"version\": \"${VER}\"" src-tauri/tauri.conf.json package.json
+          cargo update --manifest-path src-tauri/Cargo.toml --workspace --offline >/dev/null 2>&1 || true
+          grep -A1 '^name = "codeg"$' src-tauri/Cargo.lock | head -2
+
       - name: Build server + companions (mirror official release.yml)
         if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
         run: |
