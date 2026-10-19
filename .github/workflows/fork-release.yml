@@ -61,15 +61,18 @@ jobs:
           set -euo pipefail
           # The in-place updater refuses a same-version reinstall (it would
           # destroy the rollback .bak), so every fork build gets a semver-new
-          # build number: 0.38.0 -> 0.38.1001, 1002, ... The +1000 offset keeps
-          # fork builds above any upstream patch (0.38.1 < 0.38.1001) while the
-          # leading digits stay readable as the upstream base.
+          # build number. Upstream 0.38.0 -> fork 0.38.1001, 0.38.1002, ...:
+          # the patch slot carries 1000+N, which sits above any upstream
+          # patch (0.38.1 < 0.38.1001), keeps plain 3-part semver that Cargo
+          # accepts, and stays readable as the upstream base.
           base="${{ steps.upstream.outputs.ver }}"
           n=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
             --jq "[.[] | select(.tag_name | startswith(\"${base}+fork.\"))] | length" 2>/dev/null || echo 0)
           n=$((n + 1))
           build=$((1000 + n))
-          forkver="${base}.${build}"
+          # strip the trailing ".0" (upstream .0 patch) so the build number
+          # lands in the patch slot: 0.38.0 -> 0.38.<1000+N>
+          forkver="${base%.*}.${build}"
           echo "forkver=$forkver" >> "$GITHUB_OUTPUT"
           echo "tag=${base}+fork.${n}" >> "$GITHUB_OUTPUT"
           echo "Fork version: $forkver (tag ${base}+fork.${n}, build #$n)"
@@ -145,8 +148,8 @@ jobs:
       - name: Stamp fork version into build inputs
         # CARGO_PKG_VERSION 是编译期烙进二进制的（update.rs 的 currentVersion），
         # 只在 latest.json 写版本号会让已装机器永远看到"有更新"。必须在
-        # cargo/pnpm 构建前把 forkver 写进三处版本源，二进制才真正自称新版本。
-        # Cargo.lock 同步改，避免 --frozen-lockfile / lock 校验失败。
+        # cargo/pnpm 构建前把 forkver 写进版本源，二进制才真正自称新版本。
+        # Cargo.lock 同步改，避免 lock 校验失败；JSON 用定点替换保留上游紧凑排版。
         if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
         env:
           VER: ${{ steps.forkver.outputs.forkver }}
@@ -155,7 +158,7 @@ jobs:
           sed -i "0,/^version = \".*\"/s//version = \"${VER}\"/" src-tauri/Cargo.toml
           grep -q "^version = \"${VER}\"" src-tauri/Cargo.toml
           python3 - "$VER" <<'EOF'
-          import json, sys
+          import sys
           ver = sys.argv[1]
           # Cargo.lock: bump the fork's own package entry — it's the only
           # [[package]] named "codeg" (other crates carry a vendor prefix).
@@ -174,7 +177,6 @@ jobs:
               open(path, "w").write(text.replace(needle, f'"version": "{ver}"'))
           EOF
           grep "\"version\": \"${VER}\"" src-tauri/tauri.conf.json package.json
-          cargo update --manifest-path src-tauri/Cargo.toml --workspace --offline >/dev/null 2>&1 || true
           grep -A1 '^name = "codeg"$' src-tauri/Cargo.lock | head -2
 
       - name: Build server + companions (mirror official release.yml)
