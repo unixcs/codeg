@@ -53,15 +53,36 @@ jobs:
           echo "$info" | jq -r .notes > /tmp/upstream-notes.md
           echo "Upstream: $(echo "$info" | jq -r .tag)"
 
+      - name: Compute fork build number
+        id: forkver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The in-place updater refuses a same-version reinstall (it would
+          # destroy the rollback .bak), so every fork build gets a semver-new
+          # build number: 0.38.0 -> 0.38.1001, 1002, ... The +1000 offset keeps
+          # fork builds above any upstream patch (0.38.1 < 0.38.1001) while the
+          # leading digits stay readable as the upstream base.
+          base="${{ steps.upstream.outputs.ver }}"
+          n=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq "[.[] | select(.tag_name | startswith(\"${base}+fork.\"))] | length" 2>/dev/null || echo 0)
+          n=$((n + 1))
+          build=$((1000 + n))
+          forkver="${base}.${build}"
+          echo "forkver=$forkver" >> "$GITHUB_OUTPUT"
+          echo "tag=${base}+fork.${n}" >> "$GITHUB_OUTPUT"
+          echo "Fork version: $forkver (tag ${base}+fork.${n}, build #$n)"
+
       - name: Skip if fork already has this release
         id: skip
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if gh release view "${{ steps.upstream.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if gh release view "${{ steps.forkver.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "already=true" >> "$GITHUB_OUTPUT"
-            echo "Release ${{ steps.upstream.outputs.tag }} already exists on fork — nothing to do."
+            echo "Release ${{ steps.forkver.outputs.tag }} already exists on fork — nothing to do."
           else
             echo "already=false" >> "$GITHUB_OUTPUT"
           fi
@@ -157,18 +178,18 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         run: |
           set -euo pipefail
-          pnpm tauri signer sign --app-version "${{ steps.upstream.outputs.ver }}" "dist/${ARTIFACT}.tar.gz"
+          pnpm tauri signer sign --app-version "${{ steps.forkver.outputs.forkver }}" "dist/${ARTIFACT}.tar.gz"
           test -f "dist/${ARTIFACT}.tar.gz.sig"
           ( cd dist && sha256sum ${ARTIFACT}.tar.gz > ${ARTIFACT}.tar.gz.sha256 )
 
       - name: Build latest.json
         if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
         env:
-          VER: ${{ steps.upstream.outputs.ver }}
+          VER: ${{ steps.forkver.outputs.forkver }}
         run: |
           set -euo pipefail
           SIG=$(base64 -w0 "dist/${ARTIFACT}.tar.gz.sig")
-          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${{ steps.upstream.outputs.tag }}/${ARTIFACT}.tar.gz"
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${{ steps.forkver.outputs.tag }}/${ARTIFACT}.tar.gz"
           jq -n --arg v "$VER" --arg s "$SIG" --arg u "$URL" --rawfile n /tmp/upstream-notes.md \
             '{version: $v, notes: $n, pub_date: (now | todateiso8601),
               platforms: {"linux-x86_64": {signature: $s, url: $u}}}' > dist/latest.json
@@ -180,10 +201,10 @@ jobs:
           GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh release create "${{ steps.upstream.outputs.tag }}" \
+          gh release create "${{ steps.forkver.outputs.tag }}" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "codeg ${{ steps.upstream.outputs.ver }} + floating-ball (fork)" \
-            --notes "基于上游 ${{ steps.upstream.outputs.tag }}，含悬浮球功能与 fork 更新源补丁。仅打包 linux-x64。
+            --title "codeg ${{ steps.forkver.outputs.forkver }} + floating-ball (fork)" \
+            --notes "基于上游 ${{ steps.upstream.outputs.tag }}，含悬浮球功能与 fork 更新源补丁。仅打包 linux-x64。fork 构建号 ${{ steps.forkver.outputs.forkver }}（is_newer 可见，覆盖安装不再被同版本拒绝）。
 
           $(cat /tmp/upstream-notes.md)" \
             "dist/${ARTIFACT}.tar.gz" \
