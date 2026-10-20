@@ -102,6 +102,12 @@ import {
   type WorkspaceBgFillMode,
 } from "@/lib/workspace-background"
 import { downloadWorkspaceBgMarket } from "@/lib/workspace-background-market"
+import {
+  createPrefsPusher,
+  fetchServerPrefs,
+  isSyncedKey,
+  reconcileFromServer,
+} from "@/lib/client-prefs-sync"
 
 function syncTrafficLightPosition(zoom: number) {
   if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window))
@@ -543,6 +549,38 @@ export function AppearanceProvider({
   const [floatingBallFavoriteAgents, setFloatingBallFavoriteAgentsState] =
     useState<string[]>(() => readFloatingBallFavoriteAgents())
 
+  // 服务端记忆（批v91）：悬浮球 5 件套的播种与双写。web 模式下 hydration 后
+  // 对账一次；任何 setter 变更经 pusher debounce 上收。桌面 Tauri 单机，跳过。
+  const prefsPusher = useRef(createPrefsPusher()).current
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    if ("__TAURI_INTERNALS__" in window) return
+    let cancelled = false
+    void (async () => {
+      // 等登录态就位：token 在 localStorage，web-transport 的 401 会跳登录页，
+      // 未登录时这个调用必然失败，静默即可（登录页不需要悬浮球设置）。
+      const server = await fetchServerPrefs()
+      if (cancelled) return
+      const outcome = reconcileFromServer(server)
+      if (outcome === "seeded") {
+        // 服务端赢了：把 localStorage 的新值刷进 React 状态。
+        setFloatingBallEnabledState(
+          readBool(STORAGE_KEY_FLOATING_BALL_ENABLED, false)
+        )
+        setFloatingBallPositionState(readFloatingBallPosition())
+        setFloatingBallBindingsState(readFloatingBallBindings())
+        setFloatingBallSizeState(readFloatingBallSize())
+        setFloatingBallFavoriteAgentsState(readFloatingBallFavoriteAgents())
+        prefsPusher.markSynced()
+      } else if (outcome === "pushed") {
+        prefsPusher.markSynced()
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [prefsPusher])
+
   // 聊天内容宽度：DOM 变量由 inline 脚本预置，这里持有状态供设置页回显。
   const [chatContentWidth, setChatContentWidthState] = useState<number | null>(
     () => readChatContentWidth()
@@ -710,7 +748,8 @@ export function AppearanceProvider({
   const setFloatingBallEnabled = useCallback((on: boolean) => {
     setFloatingBallEnabledState(on)
     persist(STORAGE_KEY_FLOATING_BALL_ENABLED, on ? "1" : "0")
-  }, [])
+    prefsPusher.schedule()
+  }, [prefsPusher])
 
   const setFloatingBallPosition = useCallback(
     (position: FloatingBallPosition | null) => {
@@ -721,14 +760,16 @@ export function AppearanceProvider({
         } catch {
           // 存不进去也不影响本窗口——位置只是便利，不是数据。
         }
+        prefsPusher.schedule()
         return
       }
       persist(
         STORAGE_KEY_FLOATING_BALL_POSITION,
         JSON.stringify({ x: Math.round(position.x), y: Math.round(position.y) })
       )
+      prefsPusher.schedule()
     },
-    []
+    [prefsPusher]
   )
 
   const setFloatingBallBindings = useCallback(
@@ -741,17 +782,20 @@ export function AppearanceProvider({
         } catch {
           // 存不进去也不影响本窗口——绑定只是便利，不是数据。
         }
+        prefsPusher.schedule()
         return
       }
       persist(STORAGE_KEY_FLOATING_BALL_BINDINGS, JSON.stringify(bindings))
+      prefsPusher.schedule()
     },
-    []
+    [prefsPusher]
   )
 
   const setFloatingBallSize = useCallback((size: FloatingBallSize) => {
     setFloatingBallSizeState(size)
     persist(STORAGE_KEY_FLOATING_BALL_SIZE, size)
-  }, [])
+    prefsPusher.schedule()
+  }, [prefsPusher])
 
   const setFloatingBallFavoriteAgents = useCallback((agents: string[]) => {
     setFloatingBallFavoriteAgentsState(agents)
@@ -759,7 +803,8 @@ export function AppearanceProvider({
       STORAGE_KEY_FLOATING_BALL_FAVORITE_AGENTS,
       JSON.stringify(agents.slice(0, 5))
     )
-  }, [])
+    prefsPusher.schedule()
+  }, [prefsPusher])
 
   const setChatContentWidth = useCallback((px: number | null) => {
     chatContentWidthRef.current = px
@@ -1179,6 +1224,25 @@ export function AppearanceProvider({
     }
 
     const onStorage = (e: StorageEvent) => {
+      // 悬浮球 5 件套跨窗口同步（批v91）：本窗口收到别的窗口的变更，刷新本地
+      // 状态但**不**回推服务端——推送只由改动的那个窗口发起，防止两窗口乒乓。
+      if (isSyncedKey(e.key ?? "")) {
+        if (e.key === STORAGE_KEY_FLOATING_BALL_ENABLED) {
+          setFloatingBallEnabledState(
+            readBool(STORAGE_KEY_FLOATING_BALL_ENABLED, false)
+          )
+        } else if (e.key === STORAGE_KEY_FLOATING_BALL_POSITION) {
+          setFloatingBallPositionState(readFloatingBallPosition())
+        } else if (e.key === STORAGE_KEY_FLOATING_BALL_BINDINGS) {
+          setFloatingBallBindingsState(readFloatingBallBindings())
+        } else if (e.key === STORAGE_KEY_FLOATING_BALL_SIZE) {
+          setFloatingBallSizeState(readFloatingBallSize())
+        } else if (e.key === STORAGE_KEY_FLOATING_BALL_FAVORITE_AGENTS) {
+          setFloatingBallFavoriteAgentsState(readFloatingBallFavoriteAgents())
+        }
+        prefsPusher.markSynced()
+        return
+      }
       if (e.key === STORAGE_KEY_THEME_COLOR && e.newValue) {
         const color = e.newValue as ThemeColor
         if ((THEME_COLORS as readonly string[]).includes(color)) {
@@ -1323,6 +1387,7 @@ export function AppearanceProvider({
     reloadWorkspaceBackgroundImage,
     resetCustomThemeBaseline,
     resetCustomCssBaseline,
+    prefsPusher,
   ])
 
   return (
