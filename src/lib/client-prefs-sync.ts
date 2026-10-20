@@ -99,13 +99,39 @@ export async function fetchServerPrefs(): Promise<ServerPrefsSnapshot | null> {
   }
 }
 
-/// PUT 服务端偏好。失败静默（下一轮变更会再试）。
-export async function pushServerPrefs(blob: string): Promise<void> {
+/// 本机上次与服务端对齐的墙钟（毫秒）。两边都有数据时靠它判谁新——否则
+/// "服务端有值就覆盖本地"会把刚改完、还没等 debounce 上收的本地改动吞掉。
+const LOCAL_MS_KEY = "codeg-client-prefs-synced-at"
+
+function readLocalMs(): number {
+  try {
+    const raw = localStorage.getItem(LOCAL_MS_KEY)
+    const n = raw === null ? 0 : Number.parseInt(raw, 10)
+    return Number.isFinite(n) && n > 0 ? n : 0
+  } catch {
+    return 0
+  }
+}
+
+function writeLocalMs(ms: number): void {
+  try {
+    localStorage.setItem(LOCAL_MS_KEY, String(ms))
+  } catch {
+    // 写不进去只影响"谁新"的判定，下一次上收会重新对齐。
+  }
+}
+
+/// PUT 服务端偏好。失败静默（下一轮变更会再试）；成功才记本机对齐时间。
+export async function pushServerPrefs(
+  blob: string,
+  syncedAtMs: number = Date.now()
+): Promise<void> {
   try {
     await getTransport().call("update_client_preferences", {
       prefs: blob,
-      synced_at_ms: Date.now(),
+      synced_at_ms: syncedAtMs,
     })
+    writeLocalMs(syncedAtMs)
   } catch {
     // 静默：服务端不可达不影响本机使用。
   }
@@ -135,31 +161,47 @@ export function reconcileFromServer(
   if (localEmpty && !serverEmpty) {
     // 播种：服务端是记忆源。
     writeLocalBlock(serverKeys)
+    writeLocalMs(serverMs)
     return "seeded"
   }
-  // 两边都有：synced_at_ms 新者胜。服务端更新 → 覆盖本地；本地更新 → 上收。
-  if (serverMs > 0) {
+  // 两边都有：按墙钟新者胜。本机没记过对齐时间 = 这份本地配置早于服务端记忆
+  // （功能上线前就存在），服务端才是权威；否则谁新谁赢。
+  const localMs = readLocalMs()
+  if (serverMs > 0 && serverMs >= localMs) {
     writeLocalBlock(serverKeys)
+    writeLocalMs(serverMs)
     return "seeded"
   }
   void pushServerPrefs(buildLocalBlob(Date.now()))
   return "pushed"
 }
 
+/// 白名单内容指纹（不含墙钟）：去重与"回声"判断都看它。
+function localKeysFingerprint(): string {
+  const local = readLocalBlock()
+  const sorted: Record<string, string> = {}
+  for (const key of Object.keys(local).sort()) sorted[key] = local[key]
+  return JSON.stringify(sorted)
+}
+
 /**
  * 变更双写：白名单任一 key 变化后调用。800ms debounce（拖动悬浮球会连发），
- * 快照相同则跳过（storage 回声 / 无实质变化不 PUT）。
+ * 内容相同则跳过（storage 回声 / 无实质变化不 PUT）。
+ *
+ * 去重比的是**内容**，不含墙钟：把 syncedAtMs 也算进快照会让每次比较都不同，
+ * 去重直接失效，服务端会收到一串内容一样的 PUT。
  */
 export function createPrefsPusher() {
   let timer: ReturnType<typeof setTimeout> | null = null
-  let lastPushed: string | null = null
+  let lastPushedKeys: string | null = null
 
   const flush = () => {
     timer = null
-    const blob = buildLocalBlob(Date.now())
-    if (blob === lastPushed) return
-    lastPushed = blob
-    void pushServerPrefs(blob)
+    const keys = localKeysFingerprint()
+    if (keys === lastPushedKeys) return
+    lastPushedKeys = keys
+    const now = Date.now()
+    void pushServerPrefs(buildLocalBlob(now), now)
   }
 
   return {
@@ -168,8 +210,9 @@ export function createPrefsPusher() {
       timer = setTimeout(flush, DEBOUNCE_MS)
     },
     /// 快照基线：播种后调用，防止把刚从服务端收到的值再推回去（回声）。
+    /// 不动本机对齐时间——播种时服务端那个 ms 才是真值。
     markSynced() {
-      lastPushed = buildLocalBlob(Date.now())
+      lastPushedKeys = localKeysFingerprint()
     },
   }
 }
