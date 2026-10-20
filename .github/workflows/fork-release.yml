@@ -122,40 +122,14 @@ jobs:
             --title "上游 ${{ steps.upstream.outputs.tag }} 合并冲突，需人工介入" \
             --body "spacering-net/codeg 发布了 ${{ steps.upstream.outputs.tag }}，CI 合并进 deploy/fork-updater 时有冲突，本次未出包。请在本地：git fetch upstream && git merge ${{ steps.upstream.outputs.tag }}，解决冲突（保留悬浮球与 fork 更新源补丁）后 push 到 deploy 分支，然后手动重跑 workflow。"
 
-      - name: Install pnpm deps
-        if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
-        uses: pnpm/action-setup@v4
-
-      - name: Set up Node
-        if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: pnpm
-
-      - name: Install dependencies
-        if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
-        run: pnpm install --frozen-lockfile
-
-      - name: Build frontend
-        if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
-        run: pnpm build
-
-      - name: Set up Rust
-        if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-
       - name: Stamp fork version into build inputs
         # CARGO_PKG_VERSION 是编译期烙进二进制的（update.rs 的 currentVersion），
         # 只在 latest.json 写版本号会让已装机器永远看到"有更新"。必须在
         # cargo/pnpm 构建前把 forkver 写进版本源，二进制才真正自称新版本。
         # Cargo.lock 同步改，避免 lock 校验失败；JSON 用定点替换保留上游紧凑排版。
+        # 顺序很关键：必须在 Build frontend 之前，否则网页包内联的
+        # CODEG_APP_VERSION（next.config.ts 读 package.json）仍是上游版本，
+        # 页面打开就报"服务器已运行 X，此页面仍是 Y"。
         if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
         env:
           VER: ${{ steps.forkver.outputs.forkver }}
@@ -184,6 +158,35 @@ jobs:
           EOF
           grep "\"version\": \"${VER}\"" src-tauri/tauri.conf.json package.json
           grep -A1 '^name = "codeg"$' src-tauri/Cargo.lock | head -2
+
+      - name: Install pnpm deps
+        if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node
+        if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
+        run: pnpm build
+
+      - name: Set up Rust
+        if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
 
       - name: Build server + companions (mirror official release.yml)
         if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
