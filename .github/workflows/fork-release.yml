@@ -265,13 +265,19 @@ jobs:
     container: arm64v8/debian:12
     env:
       ARTIFACT: codeg-server-linux-arm64
+    defaults:
+      run:
+        # Container jobs default to /bin/sh (dash); the steps use bashisms
+        # (pipefail) and `set -euo pipefail`.
+        shell: bash
     steps:
       - name: Install build dependencies
         run: |
           set -euo pipefail
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential pkg-config libssl-dev git curl ca-certificates jq gh nodejs npm
+            build-essential pkg-config libssl-dev git curl ca-certificates jq gh \
+            nodejs npm file python3
 
       - name: Resolve the release the x64 job just published
         id: rel
