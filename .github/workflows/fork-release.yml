@@ -241,10 +241,179 @@ jobs:
           gh release create "${{ steps.forkver.outputs.tag }}" \
             --repo "$GITHUB_REPOSITORY" \
             --title "codeg ${{ steps.forkver.outputs.forkver }} + floating-ball (fork)" \
-            --notes "基于上游 ${{ steps.upstream.outputs.tag }}，含悬浮球功能与 fork 更新源补丁。仅打包 linux-x64。fork 构建号 ${{ steps.forkver.outputs.forkver }}（is_newer 可见，覆盖安装不再被同版本拒绝）。
+            --notes "基于上游 ${{ steps.upstream.outputs.tag }}，含悬浮球功能与 fork 更新源补丁。打包 linux-x64 与 linux-arm64。fork 构建号 ${{ steps.forkver.outputs.forkver }}（is_newer 可见，覆盖安装不再被同版本拒绝）。
 
           $(cat /tmp/upstream-notes.md)" \
             "dist/${ARTIFACT}.tar.gz" \
             "dist/${ARTIFACT}.tar.gz.sig" \
             "dist/${ARTIFACT}.tar.gz.sha256" \
             dist/latest.json
+
+  # ARM64 服务端包（NAS / 树莓派等 arm64 Linux）。等 x64 job 发布 release 和
+  # latest.json 后再跑：复用同一 tag/版本号，把 arm64 三件套（tar/sig/sha256）
+  # 追加到同一个 release。更新器按 releases/latest/download/<asset> 取包，所以
+  # 不需要改 latest.json 的 platforms。
+  #
+  # 用原生 arm runner + Debian 12 容器：目标机（Armbian bookworm）glibc 2.36，
+  # 若在 ubuntu-24.04 裸机构建会引入 GLIBC_2.38 符号而跑不起来。web 静态资产
+  # 与架构无关，直接复用 x64 包里的那份，避免在容器里再装一套 Node/pnpm。
+  build-arm64:
+    needs: sync-and-release
+    if: needs.sync-and-release.result == 'success'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    container: arm64v8/debian:12
+    env:
+      ARTIFACT: codeg-server-linux-arm64
+    steps:
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev git curl ca-certificates jq gh nodejs npm
+
+      - name: Resolve the release the x64 job just published
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=20" \
+            --jq '[.[] | select(.tag_name | contains("+fork."))] | sort_by(.created_at) | last | .tag_name')
+          test -n "$tag"
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+            --pattern latest.json --output /tmp/latest.json --clobber
+          ver=$(jq -r .version /tmp/latest.json)
+          test -n "$ver"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[].name' | grep -qx "${ARTIFACT}.tar.gz"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "arm64 assets already on $tag — nothing to do."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          echo "ARM64 build for $tag (version $ver)"
+
+      - name: Check out deploy branch
+        if: steps.rel.outputs.skip == 'false'
+        uses: actions/checkout@v4
+        with:
+          ref: deploy/fork-updater
+          fetch-depth: 0
+          token: ${{ secrets.FORK_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Merge the same upstream tag the x64 job used
+        if: steps.rel.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          # release tag "0.38.0+fork.3" -> upstream tag "v0.38.0"
+          upstream_tag="v${{ steps.rel.outputs.tag }}"
+          upstream_tag="${upstream_tag%%+*}"
+          git config user.name "fork-sync-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git remote add upstream https://github.com/spacering-net/codeg.git
+          git fetch upstream "$upstream_tag"
+          git merge --no-edit FETCH_HEAD
+
+      - name: Stamp fork version into build inputs
+        if: steps.rel.outputs.skip == 'false'
+        env:
+          VER: ${{ steps.rel.outputs.ver }}
+        run: |
+          set -euo pipefail
+          sed -i "0,/^version = \".*\"/s//version = \"${VER}\"/" src-tauri/Cargo.toml
+          grep -q "^version = \"${VER}\"" src-tauri/Cargo.toml
+          python3 - "$VER" <<'EOF'
+          import sys
+          ver = sys.argv[1]
+          lines = open("src-tauri/Cargo.lock").read().split("\n")
+          hits = [i for i, line in enumerate(lines) if line == 'name = "codeg"']
+          assert len(hits) == 1, f'expected exactly one "codeg" entry, found {len(hits)}'
+          i = hits[0]
+          assert lines[i + 1].startswith("version = "), f"unexpected lock layout at line {i}"
+          lines[i + 1] = f'version = "{ver}"'
+          open("src-tauri/Cargo.lock", "w").write("\n".join(lines))
+          for path in ("src-tauri/tauri.conf.json", "package.json"):
+              text = open(path).read()
+              needle = '"version": "0.38.0"'
+              assert text.count(needle) == 1, f"expected one version field in {path}"
+              open(path, "w").write(text.replace(needle, f'"version": "{ver}"'))
+          EOF
+          grep "\"version\": \"${VER}\"" src-tauri/tauri.conf.json package.json
+          grep -A1 '^name = "codeg"$' src-tauri/Cargo.lock | head -2
+
+      - name: Set up Rust
+        if: steps.rel.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build arm64 server + companions
+        if: steps.rel.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          cd src-tauri
+          cargo build --release --bin codeg-server --no-default-features --features server-bin
+          cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin
+          cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper
+          cargo build --release --bin codeg-cli --no-default-features --features cli-bin
+          cd ..
+          mkdir -p dist/${ARTIFACT}
+          cp src-tauri/target/release/codeg-server dist/${ARTIFACT}/
+          cp src-tauri/target/release/codeg-mcp dist/${ARTIFACT}/
+          cp src-tauri/target/release/codeg-computer-helper dist/${ARTIFACT}/
+          cp src-tauri/target/release/codeg-cli dist/${ARTIFACT}/
+          chmod +x dist/${ARTIFACT}/*
+
+      - name: Reuse the architecture-independent web assets
+        if: steps.rel.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release download "${{ steps.rel.outputs.tag }}" --repo "$GITHUB_REPOSITORY" \
+            --pattern codeg-server-linux-x64.tar.gz --output /tmp/x64.tar.gz --clobber
+          mkdir -p dist/web-src
+          tar xzf /tmp/x64.tar.gz -C dist/web-src --strip-components=1 codeg-server-linux-x64/web
+          mv dist/web-src/web dist/${ARTIFACT}/web
+          rmdir dist/web-src
+          cd dist && tar czf ${ARTIFACT}.tar.gz ${ARTIFACT}
+
+      - name: Smoke test packaged artifact
+        if: steps.rel.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          test -x "dist/${ARTIFACT}/codeg-server"
+          test -x "dist/${ARTIFACT}/codeg-mcp"
+          test -x "dist/${ARTIFACT}/codeg-computer-helper"
+          test -x "dist/${ARTIFACT}/codeg-cli"
+          test -f "dist/${ARTIFACT}/web/index.html"
+          file "dist/${ARTIFACT}/codeg-server" | grep -q "ARM aarch64"
+
+      - name: Sign bundle with fork key
+        if: steps.rel.outputs.skip == 'false'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: |
+          set -euo pipefail
+          npm install -g @tauri-apps/cli@2 >/tmp/npm-tauri.log 2>&1 || { tail -50 /tmp/npm-tauri.log; exit 1; }
+          tauri signer sign --app-version "${{ steps.rel.outputs.ver }}" "dist/${ARTIFACT}.tar.gz"
+          test -f "dist/${ARTIFACT}.tar.gz.sig"
+          ( cd dist && sha256sum ${ARTIFACT}.tar.gz > ${ARTIFACT}.tar.gz.sha256 )
+
+      - name: Upload arm64 assets to the same release
+        if: steps.rel.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release upload "${{ steps.rel.outputs.tag }}" \
+            "dist/${ARTIFACT}.tar.gz" \
+            "dist/${ARTIFACT}.tar.gz.sig" \
+            "dist/${ARTIFACT}.tar.gz.sha256" \
+            --repo "$GITHUB_REPOSITORY" --clobber
