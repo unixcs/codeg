@@ -321,16 +321,13 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.FORK_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
 
-      - name: Debug workspace
+      - name: Mark workspace safe for git
         if: steps.rel.outputs.skip == 'false'
         run: |
-          set -x
-          pwd
-          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
-          ls -la "$GITHUB_WORKSPACE" | head
-          ls -la /__w/codeg/codeg | head
-          git -C /__w/codeg/codeg rev-parse --show-toplevel || true
-          find / -maxdepth 5 -name .git -type d 2>/dev/null | head
+          # The container runs as root while checkout leaves the tree owned by
+          # the runner user; checkout's own safe.directory entry lives in a
+          # temporary HOME and does not reach later steps.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Merge the same upstream tag the x64 job used
         if: steps.rel.outputs.skip == 'false'
