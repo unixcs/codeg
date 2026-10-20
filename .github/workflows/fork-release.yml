@@ -298,8 +298,10 @@ jobs:
           GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # 按 fork 序号排序，别按 created_at：fork.6 与 fork.7 的 created_at 相同（同一提交时间），
+          # sort_by 是稳定排序，last 会取到列表里靠后的旧版本（批v91 实锤：arm64 被误判"已存在"而跳过）。
           tag=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=20" \
-            --jq '[.[] | select(.tag_name | contains("+fork."))] | sort_by(.created_at) | last | .tag_name')
+            --jq '[.[] | select(.tag_name | contains("+fork."))] | sort_by(.tag_name | capture("fork\\.(?<n>[0-9]+)$").n | tonumber) | last | .tag_name')
           test -n "$tag"
           gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
             --pattern latest.json --output /tmp/latest.json --clobber
