@@ -29,6 +29,17 @@ const withNextIntl = createNextIntlPlugin({
 
 const nextConfig: NextConfig = {
   output: "export",
+  // The build type-checks tsconfig.json minus the test files; that file says
+  // why.
+  typescript: {
+    tsconfigPath: "tsconfig.build.json",
+  },
+  // Development-only pages (`page.gallery.tsx`, e.g. the activity timeline
+  // gallery) are routes only when CODEG_GALLERY=1, so release builds never
+  // ship them.
+  ...(process.env.CODEG_GALLERY === "1"
+    ? { pageExtensions: ["gallery.tsx", "tsx", "ts", "jsx", "js"] }
+    : {}),
   env: {
     // The service worker's caches are keyed to the release; see
     // serviceWorkerUrl() in src/lib/service-worker.ts.

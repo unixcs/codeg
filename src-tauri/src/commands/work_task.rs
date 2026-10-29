@@ -635,28 +635,40 @@ pub async fn work_task_merge_unqueue_core(
     Ok(())
 }
 
-/// Accept a reviewed forge-sourced task by pushing it back to the repository
-/// it came from: an issue's task opens (or adopts) a pull request for its own
-/// branch, a pull request's task pushes onto that pull request's branch.
-/// Returns the pull request URL.
+/// Accept a reviewed task by delivering it to a forge: an issue's task opens
+/// (or adopts) a pull request for its own branch, a pull request's task pushes
+/// onto that pull request's branch, and a task without forge provenance opens
+/// one on the repository its project's `origin` names. Returns the pull
+/// request URL.
 ///
 /// Unlike the merge dispatch this awaits the WHOLE operation — a push plus two
 /// REST calls, no agent — so both success and failure land in the caller's
 /// dialog. Every gate is inside the engine, where a direct API call cannot
 /// route around it.
 ///
-/// `delete_worktree` takes the checkout along once the delivery lands, the
-/// same offer the merge and complete acceptances make. It never changes the
-/// result: a removal that fails leaves a retryable `cleanup_state` on the card
-/// and the delivered URL still comes back.
+/// `mark_done` (default `true`: what every delivery did before the choice
+/// existed) finishes the task; `false` keeps it in review with the pull
+/// request recorded, for another round that pushes into the same pull request.
+///
+/// `delete_worktree` takes the checkout along once a delivery that finishes
+/// the task lands, the same offer the merge and complete acceptances make. It
+/// never changes the result: a removal that fails leaves a retryable
+/// `cleanup_state` on the card and the delivered URL still comes back.
 pub async fn work_task_deliver_pr_core(
     id: i32,
     pr_title: Option<String>,
     draft: bool,
     delete_worktree: bool,
+    mark_done: Option<bool>,
 ) -> Result<String, DbError> {
     engine()?
-        .deliver_pr(id, pr_title, draft, delete_worktree)
+        .deliver_pr(
+            id,
+            pr_title,
+            draft,
+            delete_worktree,
+            mark_done.unwrap_or(true),
+        )
         .await
         .map_err(DbError::Validation)
 }
@@ -728,8 +740,11 @@ pub async fn work_task_cleanup_core(id: i32) -> Result<(), DbError> {
         .map_err(|blocked| DbError::Validation(blocked.message))
 }
 
-/// Diff of the task worktree vs. its recorded base (`base_sha`, so the view is
-/// stable even when the base branch advances). `file = None` → full patch.
+/// Diff of the task worktree vs. the base its branch sits on
+/// ([`crate::work_task::engine::branch_base`]: the recorded `base_sha`, moved
+/// forward only once the branch absorbed base content — so the view stays put
+/// while the base branch advances, and base content the agent merged in is not
+/// shown as the task's change). `file = None` → full patch.
 ///
 /// Uncommitted work is part of it: nothing makes the agent commit before the
 /// task reaches review (the merge generation commits the leftovers itself), so
@@ -747,14 +762,12 @@ pub async fn work_task_diff_core(
     let wt_id = task
         .worktree_folder_id
         .ok_or_else(|| AppCommandError::not_found("task has no worktree"))?;
-    let base = task
-        .base_sha
-        .clone()
-        .or(task.base_branch.clone())
-        .ok_or_else(|| AppCommandError::not_found("task has no recorded base"))?;
     let wt = get_folder_core(db, wt_id)
         .await
         .map_err(AppCommandError::from)?;
+    let base = crate::work_task::engine::branch_base(&wt.path, &task)
+        .await
+        .ok_or_else(|| AppCommandError::not_found("task has no recorded base"))?;
     crate::work_task::git::diff_patch_with_untracked(&wt.path, &base, file.as_deref()).await
 }
 
@@ -771,12 +784,15 @@ pub async fn work_task_changed_files_core(
     let Some(wt_id) = task.worktree_folder_id else {
         return Ok(vec![]);
     };
-    let Some(base) = task.base_sha.clone().or(task.base_branch.clone()) else {
+    if task.base_sha.is_none() && task.base_branch.is_none() {
         return Ok(vec![]);
-    };
+    }
     let wt = get_folder_core(db, wt_id)
         .await
         .map_err(AppCommandError::from)?;
+    let Some(base) = crate::work_task::engine::branch_base(&wt.path, &task).await else {
+        return Ok(vec![]);
+    };
     crate::work_task::git::diff_numstat_with_untracked(&wt.path, &base).await
 }
 
@@ -1065,8 +1081,9 @@ pub async fn work_task_deliver_pr(
     pr_title: Option<String>,
     draft: bool,
     delete_worktree: bool,
+    mark_done: Option<bool>,
 ) -> Result<String, DbError> {
-    work_task_deliver_pr_core(id, pr_title, draft, delete_worktree).await
+    work_task_deliver_pr_core(id, pr_title, draft, delete_worktree, mark_done).await
 }
 
 #[cfg(feature = "tauri-runtime")]

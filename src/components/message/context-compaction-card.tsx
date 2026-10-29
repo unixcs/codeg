@@ -20,10 +20,11 @@
  * Rendered as a centered, chrome-less divider (a horizontal rule flanking a
  * token-delta label) so it reads as a conversation boundary marker — "context
  * was compacted here" — not a real tool call. Recognition is by `_meta`, so it
- * works for the live stream and DB/snapshot reloads. In history the compaction
- * is hoisted to a dedicated standalone timeline item (see `message-list-view`'s
- * `"compaction"` render kind) so it sits BETWEEN turns rather than folding into
- * the preceding assistant reply.
+ * works for the live stream and DB/snapshot reloads. In history a compaction
+ * between replies is hoisted to a dedicated standalone timeline item (see
+ * `message-list-view`'s `"compaction"` render kind) so it sits BETWEEN turns
+ * rather than folding into the preceding assistant reply; one the agent ran
+ * mid-reply stays a step of that reply, on its rail, as it is drawn live.
  *
  * The ACP compaction lifecycle (claude-agent-acp 0.78.0+, codex-acp 1.13.0+)
  * can also carry the RETAINED SUMMARY — what the model kept of the dropped
@@ -206,8 +207,11 @@ export function ContextCompactionCard({ state, meta, summary }: Props) {
         : t("compacted")
   const summaryText =
     typeof summary === "string" && summary.trim().length > 0 ? summary : null
+  // `ws-msg-scope`: its hairlines are the transcript's, which a workspace
+  // background image darkens (globals.css) — it sits between messages, not in
+  // one.
   const divider = (
-    <div className="flex items-center gap-3 py-1 text-xs text-muted-foreground/80 select-none">
+    <div className="ws-msg-scope flex items-center gap-3 py-1 text-xs text-muted-foreground/80 select-none">
       <div className="h-px flex-1 bg-gradient-to-r from-transparent to-border/70" />
       <div
         className={`flex shrink-0 items-center gap-1.5${failed ? " text-destructive/80" : ""}`}
@@ -240,7 +244,7 @@ export function ContextCompactionCard({ state, meta, summary }: Props) {
   )
   if (summaryText === null) return divider
   return (
-    <div>
+    <div className="ws-msg-scope">
       {divider}
       {summaryOpen ? (
         <CompactionSummaryBody

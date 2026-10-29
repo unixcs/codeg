@@ -15,6 +15,8 @@ const testState = vi.hoisted(() => ({
   findItemIndex: vi.fn((offset: number) => Math.floor(offset / 100)),
   // The last `onScroll` virtua was handed.
   onScroll: undefined as undefined | ((offset: number) => void),
+  // The rows virtua was last told to keep mounted.
+  keepMounted: undefined as readonly number[] | undefined,
 }))
 
 vi.mock("use-stick-to-bottom", () => ({
@@ -32,12 +34,15 @@ vi.mock("virtua", async () => {
       children,
       ref,
       onScroll,
+      keepMounted,
     }: {
       children: ReactNode
       ref?: Ref<unknown>
       onScroll?: (offset: number) => void
+      keepMounted?: readonly number[]
     }) => {
       testState.onScroll = onScroll
+      testState.keepMounted = keepMounted
       useImperativeHandle(ref, () => ({
         scrollToIndex: testState.virtuaScrollToIndex,
         getItemOffset: (index: number) => testState.itemOffset(index),
@@ -77,7 +82,10 @@ vi.mock("@/components/ai-elements/message-thread", () => ({
   ),
 }))
 
-import { VirtualizedMessageThread } from "@/components/message/virtualized-message-thread"
+import {
+  rowsKeptNearEnd,
+  VirtualizedMessageThread,
+} from "@/components/message/virtualized-message-thread"
 
 function renderThread(
   content: ReactNode = <div data-testid="content">text</div>
@@ -113,6 +121,7 @@ beforeEach(() => {
   testState.itemOffset = (index: number) => index * 100
   testState.findItemIndex.mockClear()
   testState.onScroll = undefined
+  testState.keepMounted = undefined
 })
 
 describe("VirtualizedMessageThread scroll API", () => {
@@ -168,6 +177,57 @@ describe("VirtualizedMessageThread scroll API", () => {
       })
     }
   )
+})
+
+describe("VirtualizedMessageThread revealFromAbove", () => {
+  function renderWithScrollApi() {
+    const scrollApiRef = {
+      current: null,
+    } as RefObject<MessageScrollContextValue | null>
+    render(
+      <VirtualizedMessageThread
+        items={[{ id: "a" }]}
+        getItemKey={(item) => item.id}
+        renderItem={() => null}
+        scrollApiRef={scrollApiRef}
+      />
+    )
+    return scrollApiRef
+  }
+  /** An element `top` px below the top of the view (negative: above it). */
+  function at(top: number) {
+    const port = testState.scrollRef.current!
+    port.getBoundingClientRect = () => ({ top: 50 }) as DOMRect
+    const element = document.createElement("div")
+    element.getBoundingClientRect = () => ({ top: 50 + top }) as DOMRect
+    return element
+  }
+
+  it("scrolls up to a part above the view, a rem of room above it, letting go of the lock", () => {
+    // The header of a reply folding from its foot, 900px above the view.
+    const scrollApiRef = renderWithScrollApi()
+    const port = testState.scrollRef.current!
+    port.scrollTop = 4_000
+    document.documentElement.style.fontSize = "20px"
+    try {
+      scrollApiRef.current!.revealFromAbove(at(-900))
+    } finally {
+      document.documentElement.style.fontSize = ""
+    }
+    expect(testState.stopScroll).toHaveBeenCalledTimes(1)
+    expect(port.scrollTop).toBe(4_000 - 900 - 20)
+  })
+
+  it("leaves a part already in view where it is, however close to the edge", () => {
+    const scrollApiRef = renderWithScrollApi()
+    const port = testState.scrollRef.current!
+    port.scrollTop = 4_000
+    for (const top of [240, 8, 0]) {
+      scrollApiRef.current!.revealFromAbove(at(top))
+    }
+    expect(testState.stopScroll).not.toHaveBeenCalled()
+    expect(port.scrollTop).toBe(4_000)
+  })
 })
 
 describe("VirtualizedMessageThread viewport top", () => {
@@ -228,6 +288,74 @@ describe("VirtualizedMessageThread viewport top", () => {
     testState.onScroll?.(300)
     await new Promise((resolve) => requestAnimationFrame(resolve))
     expect(testState.findItemIndex).not.toHaveBeenCalled()
+  })
+})
+
+describe("VirtualizedMessageThread near the end", () => {
+  const items = Array.from({ length: 50 }, (_, i) => ({ id: `item-${i}` }))
+  const props = {
+    getItemKey: (item: { id: string }) => item.id,
+    renderItem: () => null,
+    bufferSize: 800,
+  }
+
+  it("keeps the rows from the buffer above the view to the end mounted", async () => {
+    const view = render(<VirtualizedMessageThread items={items} {...props} />)
+    expect(testState.keepMounted).toBeUndefined()
+
+    // 4500 of 5000 with a 500 viewport: the end is in view. The buffer above
+    // reaches back to 3700, row 37.
+    testState.scrollOffset = 4_500
+    testState.onScroll?.(4_500)
+    await waitFor(() =>
+      expect(testState.keepMounted).toEqual(
+        Array.from({ length: 13 }, (_, i) => 37 + i)
+      )
+    )
+
+    // History paged in above: the same items stay kept, at their new rows.
+    view.rerender(
+      <VirtualizedMessageThread
+        items={[{ id: "older-0" }, { id: "older-1" }, ...items]}
+        {...props}
+      />
+    )
+    expect(testState.keepMounted).toEqual(
+      Array.from({ length: 13 }, (_, i) => 39 + i)
+    )
+
+    // Back up the list, nothing is held.
+    testState.scrollOffset = 1_000
+    testState.onScroll?.(1_000)
+    await waitFor(() => expect(testState.keepMounted).toBeUndefined())
+  })
+
+  it("lets go once rows appended under a still view move the end away", async () => {
+    testState.scrollOffset = 4_500
+    const view = render(<VirtualizedMessageThread items={items} {...props} />)
+    await waitFor(() => expect(testState.keepMounted).toHaveLength(13))
+
+    // A reply streams in below; nobody scrolls.
+    testState.scrollSize = 9_000
+    view.rerender(
+      <VirtualizedMessageThread
+        items={[...items, { id: "item-50" }, { id: "item-51" }]}
+        {...props}
+      />
+    )
+    await waitFor(() => expect(testState.keepMounted).toBeUndefined())
+  })
+
+  it("holds rows only while the end is within a viewport of the view", () => {
+    const view = {
+      viewportSize: 500,
+      scrollSize: 5_000,
+      bufferSize: 800,
+      findItemIndex: (offset: number) => Math.floor(offset / 100),
+    }
+    expect(rowsKeptNearEnd({ ...view, offset: 3_900 })).toBeNull()
+    expect(rowsKeptNearEnd({ ...view, offset: 4_000 })).toBe(32)
+    expect(rowsKeptNearEnd({ ...view, offset: 400, scrollSize: 900 })).toBe(0)
   })
 })
 

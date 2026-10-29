@@ -61,6 +61,7 @@ import { closeCurrentWindow } from "@/lib/platform"
 import { getShellTransport, isDesktop } from "@/lib/transport"
 import { SearchCommandDialog } from "@/components/conversations/search-command-dialog"
 import { FloatingBall } from "@/components/layout/floating-ball"
+import { useVisibleConversationTabs } from "@/stores/tab-store"
 import { WorkspaceFolderDialog } from "@/components/layout/workspace-folder-dialog"
 import { stepZoom, DEFAULT_ZOOM_LEVEL } from "@/lib/theme-presets"
 import { toast } from "sonner"
@@ -102,7 +103,7 @@ export function WorkspaceChromeController() {
   const { toggle: toggleTerminal } = useTerminalContext()
   const { openNewConversationTab, openTab, switchTab, closeTab } =
     useTabActions()
-  const tabs = useTabStore((s) => s.tabs)
+  const tabs = useVisibleConversationTabs()
   const activeTabId = useTabStore((s) => s.activeTabId)
   // cycleRecentSessions picks from the localStorage LRU queue; isAvailable
   // filters to conversations this window can actually open (cross-window

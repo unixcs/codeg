@@ -1,5 +1,6 @@
 "use client"
 
+import { useFolderTabsStore } from "@/stores/folder-tabs-store"
 import {
   memo,
   useCallback,
@@ -118,6 +119,7 @@ import {
   locateEntry,
   reconcileLayout,
   computeStickyState,
+  conversationRowTimestamp,
   flatIndexOfConversation,
   folderHeaderFlatIndices,
   formatRelative,
@@ -206,6 +208,21 @@ const EMPTY_CHILD_TO_PARENT: ReadonlyMap<number, number> = new Map()
 const EMPTY_CONTAINER_CHILDREN: ReadonlyMap<number, readonly number[]> =
   new Map()
 
+function FolderDisclosureChevron({ expanded }: { expanded: boolean }) {
+  return (
+    <ChevronRight
+      aria-hidden
+      className={cn(
+        "h-3 w-3 shrink-0 text-muted-foreground/60",
+        "transition-[transform,opacity] duration-200 ease-out",
+        "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100",
+        "[@media(hover:none)]:opacity-100",
+        expanded && "rotate-90"
+      )}
+    />
+  )
+}
+
 const FolderHeader = memo(function FolderHeader({
   folderId,
   folderName,
@@ -242,6 +259,8 @@ const FolderHeader = memo(function FolderHeader({
   variant = "repo",
   worktreeBranch = null,
   rootBranch = null,
+  scopeShownBelow = false,
+  foldedScopes,
 }: {
   folderId: number
   folderName: string
@@ -342,11 +361,31 @@ const FolderHeader = memo(function FolderHeader({
    * bare "root" this row carried before there was a branch to show.
    */
   rootBranch?: string | null
+  /**
+   * While tabs follow the folder, a container's own scope is its main
+   * worktree's, and the "root" row under it wears the selected mark: true
+   * while that row is in the list, so the container does not wear it too.
+   * Folded away (or filtered out), the container wears it again.
+   */
+  scopeShownBelow?: boolean
+  /**
+   * The worktree scopes folded away inside this container: while one of them
+   * is the scope, the container wears the mark for it, there being no row of
+   * its own to show it. Must be referentially stable to preserve the memo.
+   */
+  foldedScopes?: readonly number[]
 }) {
   // Own the translations here rather than receiving `t` as a prop: next-intl
   // returns a fresh `t` on every parent render, so passing it down would defeat
   // this component's memo and re-render every header on each status event.
   const t = useTranslations("Folder.sidebar")
+  const tabsFollowFolder = useFolderTabsStore((s) => s.enabled)
+  const scopeSelected = useFolderTabsStore(
+    (s) =>
+      s.enabled &&
+      ((s.scope === folderId && !scopeShownBelow) ||
+        (typeof s.scope === "number" && !!foldedScopes?.includes(s.scope)))
+  )
   const tTags = useTranslations("ConversationTags")
   const ime = useImeGuard()
   // Only flag a stale default once the live list is known; before fresh,
@@ -407,20 +446,32 @@ const FolderHeader = memo(function FolderHeader({
           >
             <div
               onPointerDown={(e) => onGripPointerDown?.(folderId, e)}
+              // While tabs follow the folder, the folder on screen wears the
+              // selected-row tint the conversation cards use.
+              data-scope-selected={scopeSelected || undefined}
               className={cn(
                 "group flex h-[1.9375rem] w-full items-center",
                 "rounded-full",
                 "transition-colors duration-150",
-                isDragging
-                  ? "cursor-grabbing"
-                  : "cursor-grab hover:bg-[color-mix(in_oklab,var(--sidebar-accent),var(--sidebar-foreground)_2%)]"
+                isDragging ? "cursor-grabbing" : "cursor-grab",
+                scopeSelected
+                  ? "bg-sidebar-primary/8"
+                  : !isDragging &&
+                      "hover:bg-[color-mix(in_oklab,var(--sidebar-accent),var(--sidebar-foreground)_2%)]"
               )}
             >
               <button
                 data-folder-id={folderId}
-                onClick={() => onToggle(folderId)}
+                onClick={() => {
+                  if (tabsFollowFolder) {
+                    useFolderTabsStore.getState().activateScope(folderId)
+                  } else onToggle(folderId)
+                }}
+                aria-current={scopeSelected ? "true" : undefined}
                 title={folderPath}
-                aria-expanded={expanded}
+                // While tabs follow the folder this button selects the folder;
+                // the separate chevron button below is the disclosure control.
+                aria-expanded={tabsFollowFolder ? undefined : expanded}
                 className={cn(
                   "relative flex h-full min-w-0 flex-1 items-center pr-[0.5rem] outline-none",
                   "rounded-full focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
@@ -541,19 +592,27 @@ const FolderHeader = memo(function FolderHeader({
                     row wrapper and focus lands on a child (the toggle button or the
                     sibling ⋯ menu button), so the reveal must react to focus
                     anywhere inside the row. The section header's `group` IS its
-                    button, so it uses `group-focus-visible`. Don't "normalize". */}
-                  <ChevronRight
-                    aria-hidden
-                    className={cn(
-                      "h-3 w-3 shrink-0 text-muted-foreground/60",
-                      "transition-[transform,opacity] duration-200 ease-out",
-                      "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100",
-                      "[@media(hover:none)]:opacity-100",
-                      expanded && "rotate-90"
-                    )}
-                  />
+                    button, so it uses `group-focus-visible`. Don't "normalize".
+                    While tabs follow the folder the row button selects the
+                    folder, so the chevron becomes its own disclosure button
+                    after it. */}
+                  {!tabsFollowFolder && (
+                    <FolderDisclosureChevron expanded={expanded} />
+                  )}
                 </div>
               </button>
+              {tabsFollowFolder && (
+                <button
+                  type="button"
+                  aria-label={t("toggleFolderExpanded")}
+                  aria-expanded={expanded}
+                  onPointerDown={(event) => event.stopPropagation()}
+                  onClick={() => onToggle(folderId)}
+                  className="flex size-6 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <FolderDisclosureChevron expanded={expanded} />
+                </button>
+              )}
               <button
                 type="button"
                 onClick={(e) => {
@@ -1407,22 +1466,24 @@ export function SidebarConversationList({
   )
 
   // Flat "Recent" bucket: every reachable conversation — folder-bound and chat
-  // alike — newest first, gated on the folder still being open so closing a
-  // folder also removes its sessions here. Reference reuse keeps an unrelated
-  // status event from rebuilding it and defeating the section's card memos.
+  // alike — most recently active first, gated on the folder still being open so
+  // closing a folder also removes its sessions here. Always ordered by
+  // `updated_at`, never by the sidebar's created/updated `sortMode`: "Recent"
+  // means last activity, and a session created long ago but used this morning
+  // belongs at the top. Reference reuse keeps an unrelated status event from
+  // rebuilding it and defeating the section's card memos.
   const recentConvsRef = useRef<DbConversationSummary[]>([])
   const recentConversations = useMemo(() => {
     const next = selectRecentConversationsWithReuse(
       shownConversations,
       showCompleted,
-      sortMode,
       openFolderIds,
       recentConvsRef.current,
       recentFilter
     )
     recentConvsRef.current = next
     return next
-  }, [shownConversations, showCompleted, sortMode, openFolderIds, recentFilter])
+  }, [shownConversations, showCompleted, openFolderIds, recentFilter])
 
   // Maps each open worktree child folder → its (open) root folder. A child is
   // only redirected when its parent is also open, so a worktree whose root was
@@ -1625,6 +1686,17 @@ export function SidebarConversationList({
       folderGroupExpanded,
       tagFilterActive,
     ]
+  )
+
+  // Containers whose "root" row is in the list: while tabs follow the folder,
+  // that row — not the container above it — wears the container's selected
+  // mark.
+  const rootGroupRowIds = useMemo(
+    () =>
+      new Set(
+        rows.flatMap((row) => (row.kind === "root-group" ? [row.folderId] : []))
+      ),
+    [rows]
   )
 
   // Latest snapshots for the imperative scroll/drag code paths, refreshed every
@@ -2823,6 +2895,13 @@ export function SidebarConversationList({
       : opts.collapsed
         ? false
         : (folderExpanded[folderId] ?? true)
+    // While tabs follow the folder, the row that shows a scope wears its mark:
+    // a container's own is its "root" row's, and a container folded over its
+    // worktrees wears theirs, their rows gone with the fold.
+    const scopeShownBelow =
+      isContainer && expanded && rootGroupRowIds.has(folderId)
+    const foldedScopes =
+      isContainer && !expanded ? containerChildren.get(folderId) : undefined
     return (
       <FolderHeader
         folderId={folderId}
@@ -2877,6 +2956,8 @@ export function SidebarConversationList({
             ? (branches.get(folderId) ?? folderEntry?.gitBranch ?? null)
             : null
         }
+        scopeShownBelow={scopeShownBelow}
+        foldedScopes={foldedScopes}
       />
     )
   }
@@ -3183,10 +3264,11 @@ export function SidebarConversationList({
           selectedConversation?.id === conv.id
         }
         isOpenInTab={openTabKeys.has(`${conv.agent_type}:${conv.id}`)}
-        timeLabel={formatRelative(
-          sortMode === "updated" ? conv.updated_at : conv.created_at,
-          now
-        )}
+        // The stamp the row is ordered by, so the label explains its position:
+        // Recent's and Chat's own rows read their last activity even while the
+        // rest of the sidebar is sorted by creation time, and sub-sessions
+        // their creation time even while it is sorted by activity.
+        timeLabel={formatRelative(conversationRowTimestamp(row, sortMode), now)}
         onSelect={handleSelect}
         onDoubleClick={handleDoubleClick}
         onRename={handleRename}

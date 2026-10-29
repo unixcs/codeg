@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
 import { useTranslations } from "next-intl"
 import { isImeCompositionKey } from "@/lib/ime-composition"
 import { Button } from "@/components/ui/button"
@@ -87,6 +87,7 @@ import {
   clearMessageInputDraftV2,
   loadMessageInputDraftV2,
   saveMessageInputDraftV2,
+  setLiveComposerContent,
 } from "@/lib/message-input-draft"
 import { rankByTextMatch } from "@/lib/fuzzy-text-match"
 import {
@@ -103,6 +104,7 @@ import { textToInlineContent } from "@/components/chat/composer/plain-text-conte
 import { isEmbeddedReferenceUri } from "@/components/chat/composer/reference-uri"
 import {
   applyExpertReference,
+  blankLineAfter,
   isComposerEmpty,
   restampSkillPrefixes,
 } from "@/components/chat/composer/composer-commands"
@@ -143,20 +145,32 @@ import { useComposerShortcuts } from "@/components/chat/composer/use-composer-sh
  * as the leading invocation badge (serializes to `${prefix}${id}` as the first
  * token).
  */
-export interface ComposerInjectContent {
-  text: string
-  skill?: { id: string; label: string }
-  /**
-   * How `text` lands in the composer.
-   *
-   * - `"replace"` (default) swaps the whole document — the welcome quick-action
-   *   behaviour, where the card's prompt IS the message.
-   * - `"append"` keeps whatever the user has already drafted and adds `text` as
-   *   a trailing block, caret after it. Used for quoting a message selection,
-   *   which is only ever the *start* of what the user is about to write.
-   */
-  mode?: "replace" | "append"
-}
+export type ComposerInjectContent =
+  | {
+      text: string
+      skill?: { id: string; label: string }
+      /**
+       * How `text` lands in the composer.
+       *
+       * - `"replace"` (default) swaps the whole document — the welcome
+       *   quick-action behaviour, where the card's prompt IS the message.
+       * - `"append"` keeps whatever the user has already drafted and adds
+       *   `text` as a trailing block, caret after it. Used for quoting a
+       *   message selection, which is only ever the *start* of what the user
+       *   is about to write.
+       */
+      mode?: "replace" | "append"
+    }
+  | {
+      /**
+       * A message this composer already let go of — a send the backend turned
+       * away after the composer had cleared itself for it — as the blocks it
+       * was sent as. It comes back whole, badges and images included, and
+       * AFTER whatever the composer holds by then: usually nothing, but what
+       * the user has started writing since is never replaced.
+       */
+      handBack: PromptInputBlock[]
+    }
 
 interface MessageInputProps {
   onSend: (draft: PromptDraft, modeId?: string | null) => void
@@ -303,6 +317,11 @@ function stripEmbeddedReferences(doc: JSONContent): JSONContent {
   return { ...doc, content }
 }
 
+/** The notice for a send held while the agent is still responding (see
+ *  `handleSend`), under one id: pressing Enter into the hold again updates the
+ *  toast on screen instead of stacking another copy of it. */
+const HELD_WHILE_RESPONDING_TOAST = "composer-held-while-responding"
+
 function SelectorLoadingChip({ label }: { label: string }) {
   return (
     <div className="flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground">
@@ -444,6 +463,21 @@ export function MessageInput({
     setComposerEmpty(ed ? isComposerEmpty(ed) : true)
   }, [])
 
+  // What this composer holds that its saved draft may not show yet — typing
+  // inside the save debounce, image attachments (never saved), a file still
+  // being read or uploaded — reported per draft key for the tab store, which
+  // reads it before tidying a "blank" draft tab away. An intake is reported
+  // the moment it starts; the rest once React has committed it (below).
+  const composerId = useId()
+  const reportIntakeStart = useCallback(() => {
+    if (!effectiveDraftStorageKey) return
+    setLiveComposerContent(
+      effectiveDraftStorageKey,
+      `${composerId}:intake`,
+      true
+    )
+  }, [composerId, effectiveDraftStorageKey])
+
   // Attachments (images → thumbnail strip, files → inline badges) and the "+"
   // menu's insertable shortcuts. Both are shared with the to-do task composers,
   // so paste/drop/pick and the skill/quick-message entries behave identically
@@ -456,6 +490,7 @@ export function MessageInput({
     attachmentTabId,
     defaultPath,
     logLabel: "MessageInput",
+    onIntakeStart: reportIntakeStart,
   })
   const {
     attachments,
@@ -718,7 +753,21 @@ export function MessageInput({
     // and lets the cleanup cancel our own rAF before it runs.
     const raf = requestAnimationFrame(() => {
       const handle = editorRef.current
-      if (handle) {
+      if ("handBack" in payload) {
+        // Added after whatever the composer holds, never in its place. The
+        // restore's edits reach `handleComposerChange` like typing does, so
+        // the stored draft the send cleared is written again too.
+        const editor = handle?.getEditor()
+        if (editor) {
+          hydrateFromBlocks(
+            editor,
+            payload.handBack,
+            knownInvocationsRef.current,
+            { append: true }
+          )
+          setComposerEmpty(isComposerEmpty(editor))
+        }
+      } else if (handle) {
         if (payload.mode === "append") {
           // Land at the end of whatever is already drafted, separated by a blank
           // line so a Markdown block (the quote) is never glued onto the tail of
@@ -727,15 +776,10 @@ export function MessageInput({
           // remembered selection is stale and could be anywhere.
           const editor = handle.getEditor()
           const existing = editor ? serializeDocToText(editor.state.doc) : ""
-          const gap = !existing.trim()
-            ? ""
-            : existing.endsWith("\n\n")
-              ? ""
-              : existing.endsWith("\n")
-                ? "\n"
-                : "\n\n"
           handle.focus()
-          handle.insertTextAtCursor(`${gap}${payload.text}\n\n`)
+          handle.insertTextAtCursor(
+            `${blankLineAfter(existing)}${payload.text}\n\n`
+          )
         } else {
           handle.setText(payload.text)
           // Prepend the skill as the leading invocation badge, so the sent
@@ -759,7 +803,13 @@ export function MessageInput({
       onInjectConsumed?.()
     })
     return () => cancelAnimationFrame(raf)
-  }, [injectContent, composerReady, skillPrefix, onInjectConsumed])
+  }, [
+    injectContent,
+    composerReady,
+    skillPrefix,
+    onInjectConsumed,
+    hydrateFromBlocks,
+  ])
 
   // A skill / expert badge freezes its invocation prefix (`$` for Codex, `/`
   // elsewhere) at insert time. On the welcome page users routinely click a
@@ -900,6 +950,32 @@ export function MessageInput({
   const imageAttachments = attach.imageAttachments
   const hasAttachments = attachments.length > 0
   const hasSendableContent = !composerEmpty || hasAttachments
+  // The committed half of the report above: what the composer holds, and
+  // whether an intake is still in flight (once it settles, what it brought is
+  // already in `hasSendableContent` here). `intakeRevision` re-runs this after
+  // every intake, even one that started and settled within one render batch,
+  // where `intakePending` reads false both times.
+  const { intakePending, intakeRevision } = attach
+  useEffect(() => {
+    if (!effectiveDraftStorageKey) return
+    const intakeId = `${composerId}:intake`
+    setLiveComposerContent(
+      effectiveDraftStorageKey,
+      composerId,
+      hasSendableContent
+    )
+    setLiveComposerContent(effectiveDraftStorageKey, intakeId, intakePending)
+    return () => {
+      setLiveComposerContent(effectiveDraftStorageKey, composerId, false)
+      setLiveComposerContent(effectiveDraftStorageKey, intakeId, false)
+    }
+  }, [
+    composerId,
+    effectiveDraftStorageKey,
+    hasSendableContent,
+    intakePending,
+    intakeRevision,
+  ])
 
   // ── Slash command autocomplete ──
   //
@@ -1251,7 +1327,7 @@ export function MessageInput({
   // reproduces the shortcut everywhere in the box. Reading the clipboard happens
   // inside the menu-click / keydown user gesture, so the async Clipboard API has
   // the activation it needs.
-  const handleContextPaste = useCallback(async () => {
+  const pasteFromClipboard = useCallback(async () => {
     if (disabled) return
     const editor = editorRef.current?.getEditor()
     if (!editor) return
@@ -1294,6 +1370,17 @@ export function MessageInput({
       toast.error(t("pasteUnavailable"))
     }
   }, [disabled, attach, t])
+  // Content is on its way from the first clipboard read on: counted as an
+  // intake, so draft tidying never takes this composer for blank meanwhile.
+  const handleContextPaste = useCallback(async () => {
+    if (disabled) return
+    const settle = attach.beginIntake()
+    try {
+      await pasteFromClipboard()
+    } finally {
+      settle()
+    }
+  }, [attach, disabled, pasteFromClipboard])
 
   // Bridges the composer's Ctrl/⌘+Shift+V key to the plain-text paste above.
   // Returns whether the shortcut was consumed: when disabled or when the async
@@ -1568,6 +1655,16 @@ export function MessageInput({
       return
     }
 
+    // Prompting with no queue to park the draft in (a canvas card). The backend
+    // runs one prompt per turn and turns a second one away, so sending here
+    // only ever bounced — after this composer had cleared itself for it, which
+    // is how the message used to vanish. Keep it where it is instead: like the
+    // upload gate above, a "wait a moment", not a loss.
+    if (isPrompting) {
+      toast.info(t("heldWhileResponding"), { id: HELD_WHILE_RESPONDING_TOAST })
+      return
+    }
+
     onSend(draft, showModeSelector ? effectiveModeId : null)
     if (effectiveDraftStorageKey) {
       clearMessageInputDraftV2(effectiveDraftStorageKey)
@@ -1577,6 +1674,7 @@ export function MessageInput({
     disabled,
     hasUploadingImage,
     tAttach,
+    t,
     buildDraft,
     isEditingQueueItem,
     isPrompting,

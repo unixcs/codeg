@@ -1,5 +1,9 @@
 "use client"
 
+import {
+  shouldSeedConversation,
+  useFolderTabsStore,
+} from "@/stores/folder-tabs-store"
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   AlertCircle,
@@ -19,17 +23,22 @@ import {
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 import {
+  extractPermissionToolCallId,
   getCachedSelectors,
   useAcpActions,
   useAcpEvent,
-  useConnectionStore,
 } from "@/contexts/acp-connections-context"
+import { ActivityLiveProvider } from "@/components/message/activity/activity-live-context"
 import { useAcpAgents } from "@/hooks/use-acp-agents"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
+import { FolderTabsEmptyState } from "@/components/conversations/folder-tabs-empty-state"
 import { useTabActions, useTabStore } from "@/contexts/tab-context"
 import {
   groupOfTab,
+  useVisibleConversationTabs,
+  useVisibleConversationLayout,
+  shellGroupOfTab,
   isReparentUnmount,
   reparentedViewRuntimeConversationId,
   trackConversationView,
@@ -92,10 +101,6 @@ import {
 } from "@/lib/api"
 import { isWindowedDetail } from "@/lib/turn-window"
 import {
-  hasTranscriptOverlay,
-  isOutOfTurnContentEvent,
-} from "@/lib/background-agent"
-import {
   flushRetryDelayMs,
   isConnectionReady,
   shouldQueueDirectSend,
@@ -104,6 +109,7 @@ import {
 import { TurnBusyError } from "@/lib/turn-busy"
 import { deliverQueuedSteer } from "@/lib/queued-steer"
 import { toErrorMessage } from "@/lib/app-error"
+import { blockingPrompts } from "@/lib/blocking-prompts"
 import { notify } from "@/lib/notify"
 import {
   claimRuntimeSession,
@@ -116,6 +122,7 @@ import {
 } from "@/stores/conversation-runtime-store"
 import { useShallow } from "zustand/react/shallow"
 import { useConversationDetail } from "@/hooks/use-conversation-detail"
+import { useOutOfTurnContentNotice } from "@/hooks/use-out-of-turn-content-notice"
 import {
   buildSteerPayload,
   extractUserImagesFromDraft,
@@ -325,7 +332,6 @@ const ConversationTabView = memo(function ConversationTabView({
     removeOptimisticTurn,
     appendViewerUserTurn,
     completeTurn,
-    markOutOfTurnContent,
     refetchDetail,
     syncTurnMetadata,
     setAcpLoadError,
@@ -336,9 +342,6 @@ const ConversationTabView = memo(function ConversationTabView({
     setSyncState,
   } = useConversationRuntimeActions()
   const acpActions = useAcpActions()
-  // Stable store handle, for event-time status reads that must not go through
-  // an effect-refreshed ref (see the out-of-turn subscriber below).
-  const connectionStore = useConnectionStore()
 
   // Stable runtime session key — set once at mount, never changes.
   // For new conversations this is a virtual (negative) ID; for existing
@@ -1001,48 +1004,8 @@ const ConversationTabView = memo(function ConversationTabView({
     )
   )
 
-  // An agent can run a turn CODEG never started: CodeBuddy drains a finished
-  // background task by prompting itself, and streams a whole turn for it.
-  // `applyStreamingAction`'s out-of-turn guard drops that content because the
-  // `background_activity` overlay is supposed to own it — but that overlay only
-  // has a producer for Claude Code, so for every other agent the turn renders
-  // nowhere and the session looks frozen until it is reopened. The content IS
-  // on disk and the agent's own parser already reads it correctly, so flag the
-  // session and let the timeline offer a re-read.
-  //
-  // This runs per streamed token, so every step is O(1) and ordered cheapest
-  // first; the reducer also early-returns once the flag is set.
-  useAcpEvent(
-    useCallback(
-      (envelope: EventEnvelope) => {
-        if (!isOutOfTurnContentEvent(envelope)) return
-        if (envelope.connection_id !== conn.connectionId) return
-        // The same condition the guard drops on, read from the SAME place the
-        // guard read it. Not `connStatusRef`: that is refreshed in an effect,
-        // so it still says "connected" for any envelope that lands between the
-        // StatusChanged(prompting) dispatch and React committing — which is
-        // exactly the burst at the start of every turn, and would arm the pill
-        // on turns we started ourselves. `getConnection` reads the store the
-        // reducer just wrote, and subscribers fire after that write.
-        if (connectionStore.getConnection(tabId)?.status === "prompting") return
-        // Unknown agent (no connection bound yet) → no pill. A connection that
-        // is streaming content always carries its type, so this only degrades
-        // to today's behavior in a case that shouldn't arise.
-        if (conn.agentType == null || hasTranscriptOverlay(conn.agentType)) {
-          return
-        }
-        markOutOfTurnContent(effectiveConversationId)
-      },
-      [
-        conn.agentType,
-        conn.connectionId,
-        connectionStore,
-        tabId,
-        effectiveConversationId,
-        markOutOfTurnContent,
-      ]
-    )
-  )
+  // A turn the agent runs on its own renders nowhere live; offer a re-read.
+  useOutOfTurnContentNotice(tabId, conn.connectionId, effectiveConversationId)
 
   useEffect(() => {
     if (effectiveConversationId <= 0) return
@@ -2219,51 +2182,69 @@ const ConversationTabView = memo(function ConversationTabView({
     [effectiveConversationId]
   )
 
+  // Which tool call a pending approval is about, so the activity timeline can
+  // mark that step as waiting on the user; whether any blocking prompt is
+  // open, so a live reply stops saying its agent is at work; and how the
+  // connection's answered approvals went, for the chips on their rows.
+  const awaitingToolCallId = extractPermissionToolCallId(
+    conn.pendingPermission?.tool_call
+  )
+  const awaitingUser = blockingPrompts(conn) !== null
+  const approvals = conn.toolApprovals
+  const activityLive = useMemo(
+    () => ({ awaitingToolCallId, awaitingUser, approvals }),
+    [awaitingToolCallId, awaitingUser, approvals]
+  )
+
   const messageListNode = (
     <GoalControlProvider value={goalControlValue}>
-      <MessageListView
-        conversationId={effectiveConversationId}
-        imageRoot={workingDirForConnection ?? null}
-        agentType={selectedAgent}
-        availableCommands={connectionCommands}
-        connStatus={connStatus}
-        isActive={isActive}
-        sendSignal={sendSignal}
-        detailLoading={detailLoading}
-        detailError={detailError}
-        acpLoadError={acpLoadError}
-        hideEmptyState={!hasPersistedConversation || hasSentMessage}
-        // The conversation page's navigator, plan and sub-agents show in the
-        // Session Details side panel rather than over the messages.
-        insightsInSidebar
-        onReload={canShowDetailErrorActions ? handleReloadDetail : undefined}
-        onNewSession={
-          canShowDetailErrorActions ? handleOpenNewSession : undefined
-        }
-        onQuoteSelection={composerAvailable ? handleQuoteSelection : undefined}
-        // Asking opens its own conversation, so it needs a folder to open it in
-        // rather than a usable composer here — a transcript whose composer is
-        // blocked (session/load failure) can still spawn the question elsewhere.
-        onAskSelection={canAskSelection ? handleAskSelection : undefined}
-        // Fork carries no draft, so — unlike a send — a non-empty queue is
-        // not at risk of being jumped and needs no guard here. A turn in
-        // flight is still rejected, by the backend, which is the only place
-        // that can see it without racing.
-        //
-        // "prompting" belongs on this side of the gate (same shape as the
-        // goal-control gate above): this answers "can this surface fork at
-        // all", and a turn in flight is a passing "not right now" that the
-        // view greys the button out for. Dropping the handler instead made
-        // every reply's fork icon disappear for the length of each reply.
-        // `handleForkFromTurn` re-checks liveness at click time.
-        onForkFromTurn={
-          (connStatus === "connected" || connStatus === "prompting") &&
-          hasPersistedConversation &&
-          conn.supportsFork
-            ? handleForkFromTurn
-            : undefined
-        }
-      />
+      <ActivityLiveProvider value={activityLive}>
+        <MessageListView
+          conversationId={effectiveConversationId}
+          imageRoot={workingDirForConnection ?? null}
+          agentType={selectedAgent}
+          availableCommands={connectionCommands}
+          connStatus={connStatus}
+          isActive={isActive}
+          sendSignal={sendSignal}
+          detailLoading={detailLoading}
+          detailError={detailError}
+          acpLoadError={acpLoadError}
+          hideEmptyState={!hasPersistedConversation || hasSentMessage}
+          // The conversation page's navigator, plan and sub-agents show in the
+          // Session Details side panel rather than over the messages.
+          insightsInSidebar
+          onReload={canShowDetailErrorActions ? handleReloadDetail : undefined}
+          onNewSession={
+            canShowDetailErrorActions ? handleOpenNewSession : undefined
+          }
+          onQuoteSelection={
+            composerAvailable ? handleQuoteSelection : undefined
+          }
+          // Asking opens its own conversation, so it needs a folder to open it in
+          // rather than a usable composer here — a transcript whose composer is
+          // blocked (session/load failure) can still spawn the question elsewhere.
+          onAskSelection={canAskSelection ? handleAskSelection : undefined}
+          // Fork carries no draft, so — unlike a send — a non-empty queue is
+          // not at risk of being jumped and needs no guard here. A turn in
+          // flight is still rejected, by the backend, which is the only place
+          // that can see it without racing.
+          //
+          // "prompting" belongs on this side of the gate (same shape as the
+          // goal-control gate above): this answers "can this surface fork at
+          // all", and a turn in flight is a passing "not right now" that the
+          // view greys the button out for. Dropping the handler instead made
+          // every reply's fork icon disappear for the length of each reply.
+          // `handleForkFromTurn` re-checks liveness at click time.
+          onForkFromTurn={
+            (connStatus === "connected" || connStatus === "prompting") &&
+            hasPersistedConversation &&
+            conn.supportsFork
+              ? handleForkFromTurn
+              : undefined
+          }
+        />
+      </ActivityLiveProvider>
     </GoalControlProvider>
   )
 
@@ -2697,9 +2678,17 @@ export function ConversationDetailPanel() {
   const conversations = useAppWorkspaceStore((s) => s.conversations)
   const allFolders = useAppWorkspaceStore((s) => s.allFolders)
   const tabs = useTabStore((s) => s.tabs)
+  const tabsFollowFolder = useFolderTabsStore((s) => s.enabled)
+  const visibleTabs = useVisibleConversationTabs()
+  const visibleLayout = useVisibleConversationLayout()
+  const visibleTabIds = useMemo(
+    () => new Set(visibleTabs.map((tab) => tab.id)),
+    [visibleTabs]
+  )
   const activeTabId = useTabStore((s) => s.activeTabId)
   const groupLayout = useTabStore((s) => s.groupLayout)
   const groupOf = useTabStore((s) => s.groupOf)
+  const groupViews = useTabStore((s) => s.groupViews)
   const groupSelection = useTabStore((s) => s.groupSelection)
   const tileByGroup = useTabStore((s) => s.tileByGroup)
   // Narrow: only the drop-TARGET group id (for the shell highlight ring) — the
@@ -2945,13 +2934,21 @@ export function ConversationDetailPanel() {
   useEffect(() => {
     if (!folder) return
 
-    if (hasNoTabs) {
+    if (
+      shouldSeedConversation(useFolderTabsStore.getState().enabled, hasNoTabs)
+    ) {
       openNewConversationTab(
         folder.id,
         newConversation?.workingDir ?? folder.path
       )
     }
-  }, [folder, hasNoTabs, newConversation?.workingDir, openNewConversationTab])
+  }, [
+    folder,
+    hasNoTabs,
+    newConversation?.workingDir,
+    openNewConversationTab,
+    tabsFollowFolder,
+  ])
 
   // Split-group render model: the layout tree only ever produces PERCENTAGE
   // RECTS — every group shell is an absolutely-positioned SIBLING keyed by its
@@ -2959,16 +2956,23 @@ export function ConversationDetailPanel() {
   // style changes and a tab that stays in its group is never reparented (a
   // reparent would remount the view and tear down a live streaming response).
   const { groups: groupRects, handles: groupHandles } = useMemo(
-    () => computeRects(groupLayout),
-    [groupLayout]
+    () => computeRects(visibleLayout),
+    [visibleLayout]
   )
-  const orderedGroupIds = useMemo(() => leafIds(groupLayout), [groupLayout])
-  const isSplit = orderedGroupIds.length > 1
+  const isSplit = leafIds(visibleLayout).length > 1
+  // Every tab sits in its own view's group shell (`shellGroupOfTab`): the
+  // folder views not on screen keep their shells, hidden, so a folder switch
+  // reparents nothing. Shells come in id order — a fixed order whatever view
+  // is on screen, so a switch never moves one (a moved node resets every
+  // transcript inside it); new shells only ever insert.
   const tabsByGroup = useMemo(() => {
     const byGroup = new Map<string, typeof tabs>()
-    for (const groupId of orderedGroupIds) byGroup.set(groupId, [])
+    for (const groupId of leafIds(groupLayout)) byGroup.set(groupId, [])
+    const state = { rawTabs: tabs, groupOf, groupLayout, groupViews }
     for (const tab of tabs) {
-      const groupId = groupOfTab(groupOf, groupLayout, tab.id)
+      const groupId = visibleTabIds.has(tab.id)
+        ? groupOfTab(groupOf, groupLayout, tab.id)
+        : shellGroupOfTab(state, tab.id)
       const bucket = byGroup.get(groupId)
       if (bucket) {
         bucket.push(tab)
@@ -2977,7 +2981,11 @@ export function ConversationDetailPanel() {
       }
     }
     return byGroup
-  }, [tabs, groupOf, groupLayout, orderedGroupIds])
+  }, [tabs, groupOf, groupLayout, groupViews, visibleTabIds])
+  const orderedGroupIds = useMemo(
+    () => [...tabsByGroup.keys()].sort(),
+    [tabsByGroup]
+  )
 
   const tileTabRefs = useRef<Map<string, HTMLDivElement | null>>(new Map())
   const groupContainerRef = useRef<HTMLDivElement | null>(null)
@@ -2991,12 +2999,14 @@ export function ConversationDetailPanel() {
         .filter(
           (groupId) =>
             tileByGroup[groupId] &&
-            (tabsByGroup.get(groupId)?.length ?? 0) > 1 &&
+            (tabsByGroup.get(groupId) ?? []).filter((tab) =>
+              visibleTabIds.has(tab.id)
+            ).length > 1 &&
             groupSelection[groupId] != null
         )
         .map((groupId) => groupSelection[groupId])
         .join("|"),
-    [orderedGroupIds, tileByGroup, tabsByGroup, groupSelection]
+    [orderedGroupIds, tileByGroup, tabsByGroup, groupSelection, visibleTabIds]
   )
   useEffect(() => {
     if (!tiledSelectionKey) return
@@ -3020,7 +3030,7 @@ export function ConversationDetailPanel() {
   }, [tabs])
 
   if (hasNoTabs) {
-    return null
+    return tabsFollowFolder ? <FolderTabsEmptyState /> : null
   }
 
   const renderTabWrapper = (
@@ -3029,9 +3039,10 @@ export function ConversationDetailPanel() {
     groupId: string,
     canTileG: boolean
   ) => {
-    const active = tab.id === activeTabId
+    const inScope = visibleTabIds.has(tab.id)
+    const active = inScope && tab.id === activeTabId
     // Visible = tiled (all group members shown) or the group's selected tab.
-    const visible = canTileG || tab.id === groupSelection[groupId]
+    const visible = inScope && (canTileG || tab.id === groupSelection[groupId])
     const folderPath = allFolders.find((f) => f.id === tab.folderId)?.path
     const view = (
       <ConversationTabView
@@ -3062,14 +3073,16 @@ export function ConversationDetailPanel() {
         data-tile-scroll-item=""
         style={canTileG ? { order: indexInGroup } : undefined}
         className={cn(
-          canTileG
-            ? cn(
-                "relative h-full min-w-[24rem] flex-1 overflow-hidden",
-                indexInGroup > 0 && "border-l border-border/50"
-              )
-            : visible
-              ? "h-full"
-              : "conversation-tab-hidden absolute inset-0 invisible pointer-events-none"
+          !inScope
+            ? "conversation-tab-hidden absolute inset-0 invisible pointer-events-none"
+            : canTileG
+              ? cn(
+                  "relative h-full min-w-[24rem] flex-1 overflow-hidden",
+                  indexInGroup > 0 && "border-l border-border/50"
+                )
+              : visible
+                ? "h-full"
+                : "conversation-tab-hidden absolute inset-0 invisible pointer-events-none"
         )}
         onPointerDownCapture={
           visible && !active ? () => switchTab(tab.id) : undefined
@@ -3086,7 +3099,7 @@ export function ConversationDetailPanel() {
             body — so without this it went on painting over whichever tab the
             user switched to. The flag is additive, so a visible tab inside a
             covered workspace stays hidden. */}
-        <OverlayHostHiddenProvider hidden={!canTileG && !visible}>
+        <OverlayHostHiddenProvider hidden={!visible}>
           {view}
         </OverlayHostHiddenProvider>
       </div>
@@ -3096,10 +3109,13 @@ export function ConversationDetailPanel() {
   // Plain function (NOT a component defined in render — that type identity
   // would change every render and remount the whole shell subtree).
   const renderGroupShell = (groupId: string) => {
-    const rect = groupRects.get(groupId)
-    if (!rect) return null
+    const inScope = groupRects.has(groupId)
+    const rect = groupRects.get(groupId) ?? { x: 0, y: 0, w: 100, h: 100 }
     const groupTabs = tabsByGroup.get(groupId) ?? []
-    const canTileG = !!tileByGroup[groupId] && groupTabs.length > 1
+    const visibleGroupTabs = groupTabs.filter((tab) =>
+      visibleTabIds.has(tab.id)
+    )
+    const canTileG = !!tileByGroup[groupId] && visibleGroupTabs.length > 1
     // Only the TOP-edge strips sit under the fixed corner overlays (the split
     // layout has no title-bar row above them) — the leftmost/rightmost of that
     // row carry the corner reserves the unsplit strip row normally provides.
@@ -3110,8 +3126,8 @@ export function ConversationDetailPanel() {
     // The group's SELECTED tab drives its header — each split group keeps the
     // full "tabs + conversation title bar" pairing of the unsplit layout.
     const selTab =
-      groupTabs.find((tab) => tab.id === groupSelection[groupId]) ??
-      groupTabs[0] ??
+      visibleGroupTabs.find((tab) => tab.id === groupSelection[groupId]) ??
+      visibleGroupTabs[0] ??
       null
     const selTabFolder = selTab
       ? allFolders.find((f) => f.id === selTab.folderId)
@@ -3130,6 +3146,8 @@ export function ConversationDetailPanel() {
           top: `${rect.y}%`,
           width: `${rect.w}%`,
           height: `${rect.h}%`,
+          visibility: inScope ? undefined : "hidden",
+          pointerEvents: inScope ? undefined : "none",
         }}
       >
         {/* While split, each group owns its own strip (the workspace layout's
@@ -3230,7 +3248,11 @@ export function ConversationDetailPanel() {
                   sibling tabs remount and a live streaming response is torn
                   down. */}
               {orderedGroupIds.map((groupId) => renderGroupShell(groupId))}
+              {/* The handles resize the on-screen view's own layout (a
+                  folder's, while tabs follow the folder), which the visible
+                  one only differs from before the tab set is known. */}
               {isSplit &&
+                visibleLayout === groupLayout &&
                 groupHandles.map((handle) => (
                   <GroupSplitHandle
                     key={`${handle.splitId}:${handle.index}`}
@@ -3239,6 +3261,13 @@ export function ConversationDetailPanel() {
                     onResize={resizeGroupSplit}
                   />
                 ))}
+              {/* The selected folder has nothing open: every shell above is
+                  hidden, other folders' live tabs included. */}
+              {tabsFollowFolder && visibleTabs.length === 0 && (
+                <div className="absolute inset-0">
+                  <FolderTabsEmptyState />
+                </div>
+              )}
             </div>
           </ContextMenuTrigger>
           <ContextMenuContent>

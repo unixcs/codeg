@@ -8,16 +8,22 @@ import {
   extractDelegationSources,
   extractMessageDelegationSources,
   groupDelegationSources,
+  hoistedCompaction,
   isForkPointUnnamed,
   markThreadTail,
   mergeConsecutiveAssistantTurns,
   singletonSourceTurns,
+  threadDelegationStatusTasks,
   type MergedAssistantRunCache,
   type ReplyFoldState,
   type ResolvedMessageGroup,
   type ThreadRenderItem,
 } from "./message-list-view"
-import type { AdaptedContentPart } from "@/lib/adapters/ai-elements-adapter"
+import type {
+  AdaptedContentPart,
+  AdaptedToolCallPart,
+} from "@/lib/adapters/ai-elements-adapter"
+import { buildDelegationStatusIndex } from "@/lib/delegation-status-index"
 import type { MessageTurn } from "@/lib/types"
 
 function turn(id: string): MessageTurn {
@@ -379,8 +385,29 @@ describe("mergeConsecutiveAssistantTurns merged-run cache", () => {
     expect(second.group).toBe(first.group)
     expect(second.group.parts).toBe(first.group.parts)
     expect(second.sourceTurns).toBe(first.sourceTurns)
-    expect(first.key).toBe("merged-persisted-a1-0")
+    expect(first.key).toBe("persisted-a1-0")
     expect(first.group.id).toBe("a1")
+  })
+
+  it("keeps a reply's row as it grows from one turn to two", () => {
+    // The agent answers its first tool mid-reply: the reply that was one turn
+    // becomes a run of two. Keyed apart, the virtual list re-mounted the
+    // whole reply at that moment.
+    const cache: MergedAssistantRunCache = new WeakMap()
+    const g1 = makeGroup("assistant", "a1")
+    const g2 = makeGroup("assistant", "a2")
+    const user = makeUserItem("u1", 0)
+
+    const [, alone] = mergeConsecutiveAssistantTurns(
+      [user, makeItem(g1, 1)],
+      cache
+    )
+    const [, run] = mergeConsecutiveAssistantTurns(
+      [user, makeItem(g1, 1), makeItem(g2, 2)],
+      cache
+    )
+
+    expect(run.key).toBe(alone.key)
   })
 
   it("rebuilds a run whose member changed without touching a neighboring run", () => {
@@ -514,7 +541,7 @@ describe("extractDelegationSources", () => {
     toolCallId: string,
     toolName: string,
     input?: string | null
-  ): AdaptedContentPart {
+  ): AdaptedToolCallPart {
     return {
       type: "tool-call",
       toolCallId,
@@ -572,14 +599,17 @@ describe("extractDelegationSources", () => {
     expect(sources[0]).toMatchObject({ parentToolUseId: "tu-b" })
   })
 
-  it("finds delegations nested inside tool-groups and goal-runs", () => {
+  it("finds delegations nested inside goal runs", () => {
     const sources = extractDelegationSources([
       {
-        type: "tool-group",
+        type: "goal-run",
+        start: toolCall("tu-goal", "create_goal", "{}"),
+        end: null,
+        isRunning: true,
         items: [
           toolCall("tu-resume", "resume_delegation", '{"task_id":"t-1"}'),
         ],
-      } as AdaptedContentPart,
+      },
     ])
     expect(sources).toHaveLength(1)
     expect(sources[0].taskIdHint).toBe("t-1")
@@ -783,6 +813,61 @@ describe("extractMessageDelegationSources", () => {
         "u1"
       )?.[0]
     ).toBe(first[0])
+  })
+})
+
+describe("threadDelegationStatusTasks", () => {
+  function statusPoll(
+    id: string,
+    taskId: string
+  ): Extract<AdaptedContentPart, { type: "tool-call" }> {
+    const report = { task_id: taskId, status: "running", message: "Running." }
+    return {
+      type: "tool-call",
+      toolCallId: id,
+      toolName: "mcp__codeg-mcp__get_delegation_status",
+      input: JSON.stringify({ task_ids: [taskId] }),
+      state: "output-available",
+      output: JSON.stringify({
+        content: [{ type: "text", text: "Running." }],
+        isError: false,
+        structuredContent: { tasks: [report] },
+      }),
+    }
+  }
+
+  it("reads the status rows of every turn, so a task's newest row is the thread's last", () => {
+    const first = assistantItem("a1", {
+      parts: [
+        {
+          type: "delegation-status-group",
+          polls: [statusPoll("p1", "t1")],
+        },
+        { type: "text", text: "Still waiting." },
+        statusPoll("p2", "t1"),
+      ],
+    })
+    const compaction: ThreadItem = {
+      key: "compaction-c1",
+      kind: "compaction",
+      meta: null,
+    }
+    const second = assistantItem("a2", {
+      parts: [
+        {
+          type: "delegation-status-group",
+          polls: [statusPoll("p3", "t1")],
+        },
+      ],
+    })
+    const tasks = threadDelegationStatusTasks([first, compaction, second])
+    expect(tasks.map((refs) => refs.map((r) => r.latestPollId))).toEqual([
+      ["p1", "p2"],
+      ["p3"],
+    ])
+    expect(buildDelegationStatusIndex(tasks).get("t1")?.latestPollId).toBe("p3")
+    // A group that keeps its identity is read once.
+    expect(threadDelegationStatusTasks([first])[0]).toBe(tasks[0])
   })
 })
 
@@ -1096,5 +1181,97 @@ describe("compactionOnlyPart", () => {
     expect(compactionOnlyPart(compactionGroup("output-available"))?.state).toBe(
       "output-available"
     )
+  })
+})
+
+describe("hoistedCompaction", () => {
+  const compacted = (id: string): ResolvedMessageGroup => ({
+    id,
+    role: "assistant",
+    parts: [
+      { type: "text", text: "" },
+      {
+        type: "tool-call",
+        toolCallId: `codex-compaction-${id}`,
+        toolName: "context_compaction",
+        input: null,
+        state: "output-available",
+        output: null,
+        meta: { contextCompaction: { version: 1 } },
+      },
+    ],
+    resources: [],
+    images: [],
+  })
+  const reply = (id: string): ResolvedMessageGroup => ({
+    id,
+    role: "assistant",
+    parts: [{ type: "text", text: `reply ${id}` }],
+    resources: [],
+    images: [],
+  })
+  const user = (id: string): ResolvedMessageGroup => ({
+    ...reply(id),
+    role: "user",
+  })
+  const placeholder = (id: string): ResolvedMessageGroup => ({
+    ...reply(id),
+    parts: [],
+  })
+  const hoisted = (groups: ResolvedMessageGroup[]) =>
+    groups.map((_, index) => hoistedCompaction(groups, index) !== null)
+
+  // codex compacts by itself when the context fills, and goes on with the
+  // same reply: live, the compaction is a step of that reply.
+  it("keeps a compaction the reply goes on after, as one of its steps", () => {
+    expect(
+      hoisted([user("u"), reply("a"), compacted("c"), reply("b"), user("v")])
+    ).toEqual([false, false, false, false, false])
+    // At the start of the reply too, and past the empty turns between.
+    expect(
+      hoisted([user("u"), compacted("c"), placeholder("p"), reply("b")])
+    ).toEqual([false, false, false, false])
+  })
+
+  it("hoists a compaction no more of the reply follows", () => {
+    // `/compact` between replies: the next message is the user's.
+    expect(
+      hoisted([reply("a"), compacted("c"), user("v"), reply("b")])
+    ).toEqual([false, true, false, false])
+    // The last thing in the thread.
+    expect(hoisted([reply("a"), compacted("c"), placeholder("p")])).toEqual([
+      false,
+      true,
+      false,
+    ])
+  })
+
+  // The persisted divider beside the live copy of the same `/compact` — both
+  // hoisted, so `dedupeCompactionItems` can fold them.
+  it("hoists a compaction only another compaction follows", () => {
+    expect(hoisted([reply("a"), compacted("c"), compacted("live")])).toEqual([
+      false,
+      true,
+      true,
+    ])
+  })
+
+  it("draws the reply as one, the compaction among its steps", () => {
+    const groups = [reply("a"), compacted("c"), reply("b")]
+    const items: ThreadItem[] = groups.map((group, index) => {
+      const compaction = hoistedCompaction(groups, index)
+      return compaction
+        ? { key: group.id, kind: "compaction", meta: compaction.meta }
+        : assistantItem(group.id, group)
+    })
+    const merged = mergeConsecutiveAssistantTurns(items)
+    expect(merged).toHaveLength(1)
+    const parts = (merged[0] as TurnItem).group.parts
+    expect(parts.map((part) => part.type)).toEqual([
+      "text",
+      "text",
+      "tool-call",
+      "text",
+    ])
   })
 })

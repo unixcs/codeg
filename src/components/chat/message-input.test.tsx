@@ -21,6 +21,7 @@ import {
 } from "./composer/to-prompt-blocks"
 import {
   clearMessageInputDraftV2,
+  hasLiveComposerContent,
   loadMessageInputDraftV2,
   saveMessageInputDraftV2,
 } from "@/lib/message-input-draft"
@@ -124,6 +125,9 @@ vi.mock("@/hooks/use-open-file-target", () => ({
 vi.mock("@/lib/api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/api")>()),
   quickMessagesList: vi.fn(async () => []),
+  // jsdom runs in web mode, where a dropped image is uploaded: keep that
+  // upload pending instead of letting a real fetch fail and drop the image.
+  uploadAttachment: vi.fn(() => new Promise(() => {})),
 }))
 // Real classifier only recognizes actual backend NoActiveTurn payloads; the
 // steering tests flip this per-case to drive the enqueue fallback.
@@ -144,6 +148,10 @@ type ComposerAttachmentsApi = ReturnType<
 const attachmentsOverride = vi.hoisted(() => ({
   current: null as Partial<ComposerAttachmentsApi> | null,
 }))
+// The real hook's latest result, for tests that drive it directly.
+const attachmentsCapture = vi.hoisted(() => ({
+  current: null as ComposerAttachmentsApi | null,
+}))
 vi.mock("./composer/use-composer-attachments", async (importOriginal) => {
   const actual =
     await importOriginal<typeof import("./composer/use-composer-attachments")>()
@@ -153,6 +161,7 @@ vi.mock("./composer/use-composer-attachments", async (importOriginal) => {
       ...args: Parameters<typeof actual.useComposerAttachments>
     ) => {
       const real = actual.useComposerAttachments(...args)
+      attachmentsCapture.current = real
       const override = attachmentsOverride.current
       return override ? { ...real, ...override } : real
     },
@@ -247,6 +256,13 @@ function renderInput(
     </NextIntlClientProvider>
   )
 }
+
+/** Runs the next animation frame inside act(), so what the composer defers to
+ *  a frame is committed — effects included — before the test goes on. */
+const nextFrame = () =>
+  act(async () => {
+    await new Promise((resolve) => requestAnimationFrame(() => resolve(null)))
+  })
 
 describe("MessageInput (RichComposer integration)", () => {
   afterEach(() => cleanup())
@@ -388,12 +404,6 @@ describe("MessageInput (RichComposer integration)", () => {
         />
       </NextIntlClientProvider>
     )
-    const nextFrame = () =>
-      act(async () => {
-        await new Promise((resolve) =>
-          requestAnimationFrame(() => resolve(null))
-        )
-      })
     async function mountReady(isActive: boolean, coarse: boolean) {
       setPointer(coarse)
       saveMessageInputDraftV2(draftKey, {
@@ -809,6 +819,307 @@ describe("MessageInput injectContent", () => {
     await waitFor(() =>
       expect(serializeDocToText(editor.state.doc)).toBe("quick action prompt")
     )
+  })
+
+  // A send handed back undelivered (a canvas card's prompt that bounced off a
+  // turn already in flight). The composer had cleared itself for it, and the
+  // user may have started writing again before it came back.
+  const imageHi = {
+    type: "image" as const,
+    data: "aGk=",
+    mime_type: "image/png",
+  }
+  const imageYo = {
+    type: "image" as const,
+    data: "eW8=",
+    mime_type: "image/png",
+  }
+  const notesFile = {
+    type: "resource" as const,
+    uri: "clipboard://notes.md-1",
+    mime_type: "text/markdown",
+    text: "# Notes",
+    blob: null,
+  }
+
+  // Enter reaches the send through the editor's keymap, which takes the
+  // composer's latest send handler in an effect — so an image on screen is not
+  // in the send until React has run the effects of the render that showed it.
+  // A hand-back that gets sent therefore has its frame run inside act().
+  function pressEnter(editor: Editor) {
+    act(() => {
+      ;(editor.view.dom as HTMLElement).dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Enter",
+          bubbles: true,
+          cancelable: true,
+        })
+      )
+    })
+  }
+
+  it("puts a handed-back message back whole into the empty composer", async () => {
+    const onSend = vi.fn()
+    const onInjectConsumed = vi.fn()
+    const { view, editor } = await mount({ onSend, onInjectConsumed })
+    const prose = "check [app.ts](file:///repo/app.ts) against the mock"
+
+    view.rerender(
+      tree({
+        onSend,
+        onInjectConsumed,
+        injectContent: {
+          handBack: [{ type: "text", text: prose }, imageHi],
+        },
+      })
+    )
+    await nextFrame() // the hand-back's own frame
+    await waitFor(() =>
+      expect(serializeDocToText(editor.state.doc)).toBe(prose)
+    )
+    // The file mention is a badge again, not its link text...
+    expect(JSON.stringify(editor.getJSON())).toContain('"type":"reference"')
+    // ...and the image is back in the strip.
+    expect(await screen.findByAltText("image.png")).toBeInTheDocument()
+    expect(onInjectConsumed).toHaveBeenCalled()
+
+    // Sending it again ships the very message the bounce took away.
+    pressEnter(editor)
+    expect(onSend).toHaveBeenCalledTimes(1)
+    expect(onSend.mock.calls[0][0].blocks).toEqual([
+      { type: "text", text: prose },
+      expect.objectContaining(imageHi),
+    ])
+  })
+
+  it("adds a hand-back after what was written since, losing neither", async () => {
+    const onSend = vi.fn()
+    const { view, editor } = await mount({ onSend })
+    act(() => {
+      editor.commands.setContent("and another thing")
+    })
+
+    view.rerender(
+      tree({
+        onSend,
+        injectContent: {
+          handBack: [{ type: "text", text: "12" }, notesFile, imageHi],
+        },
+      })
+    )
+    await nextFrame() // the hand-back's own frame
+    await waitFor(() =>
+      expect(serializeDocToText(editor.state.doc).trim()).toBe(
+        "and another thing\n\n12"
+      )
+    )
+    expect(await screen.findByAltText("image.png")).toBeInTheDocument()
+
+    // The user's newer text, the handed-back prose, its file and its image.
+    pressEnter(editor)
+    expect(onSend).toHaveBeenCalledTimes(1)
+    expect(onSend.mock.calls[0][0].blocks).toEqual([
+      { type: "text", text: "and another thing\n\n12" },
+      notesFile,
+      expect.objectContaining(imageHi),
+    ])
+  })
+
+  it("adds a handed-back image beside what was written since", async () => {
+    const onInjectConsumed = vi.fn()
+    const { view, editor } = await mount({ onInjectConsumed })
+    act(() => {
+      editor.commands.setContent("and another thing")
+    })
+
+    view.rerender(
+      tree({ onInjectConsumed, injectContent: { handBack: [imageHi] } })
+    )
+    expect(await screen.findByAltText("image.png")).toBeInTheDocument()
+    expect(onInjectConsumed).toHaveBeenCalled()
+    // Nothing to add to the text, so not even a blank line.
+    expect(serializeDocToText(editor.state.doc)).toBe("and another thing")
+  })
+
+  it("puts a handed-back file on a line of its own after what was written since", async () => {
+    const { view, editor } = await mount({})
+    act(() => {
+      editor.commands.setContent("and another thing")
+    })
+
+    view.rerender(tree({ injectContent: { handBack: [notesFile] } }))
+    await waitFor(() =>
+      expect(serializeDocToDisplayText(editor.state.doc)).toMatch(
+        /^and another thing\n\n\[notes\.md-1]\(codeg:\/\/embedded\//
+      )
+    )
+  })
+
+  it("takes a second hand-back after the first, files and images and all", async () => {
+    const onSend = vi.fn()
+    const { view, editor } = await mount({ onSend })
+
+    view.rerender(
+      tree({
+        onSend,
+        injectContent: {
+          handBack: [{ type: "text", text: "first" }, notesFile, imageHi],
+        },
+      })
+    )
+    await nextFrame() // the hand-back's own frame
+    await waitFor(() =>
+      expect(serializeDocToText(editor.state.doc).trim()).toBe("first")
+    )
+    view.rerender(
+      tree({
+        onSend,
+        injectContent: {
+          handBack: [{ type: "text", text: "second" }, imageYo],
+        },
+      })
+    )
+    await nextFrame() // the hand-back's own frame
+    // (The space is the one a restored file badge always gets after it.)
+    await waitFor(() =>
+      expect(serializeDocToText(editor.state.doc).trim()).toBe(
+        "first \n\nsecond"
+      )
+    )
+    await waitFor(() =>
+      expect(screen.getAllByAltText("image.png")).toHaveLength(2)
+    )
+
+    // The first's file is still backed by its bytes after the second landed.
+    pressEnter(editor)
+    expect(onSend.mock.calls[0][0].blocks).toEqual([
+      { type: "text", text: "first \n\nsecond" },
+      notesFile,
+      expect.objectContaining(imageHi),
+      expect.objectContaining(imageYo),
+    ])
+  })
+})
+
+// A surface with no message queue (a canvas card) still renders this composer
+// while the agent answers. The backend runs one prompt per turn, so a message
+// sent then could only bounce — and it used to be cleared out of the composer
+// on its way to that bounce, vanishing without a trace (#991).
+describe("MessageInput mid-turn send with no queue", () => {
+  const MI = enMessages.Folder.chat.messageInput
+  const DRAFT_KEY = "canvas-draft:canvas-node-1"
+
+  afterEach(() => {
+    cleanup()
+    composerHandle.current = null
+    clearMessageInputDraftV2(DRAFT_KEY)
+    vi.clearAllMocks()
+  })
+
+  function pressEnter(editor: Editor) {
+    act(() => {
+      ;(editor.view.dom as HTMLElement).dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Enter",
+          bubbles: true,
+          cancelable: true,
+        })
+      )
+    })
+  }
+
+  function tree(props: Partial<React.ComponentProps<typeof MessageInput>>) {
+    return (
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <MessageInput
+          onSend={vi.fn()}
+          promptCapabilities={CAPS}
+          onCancel={vi.fn()}
+          draftStorageKey={DRAFT_KEY}
+          {...props}
+        />
+      </NextIntlClientProvider>
+    )
+  }
+
+  async function mountWithDraft(
+    props: Partial<React.ComponentProps<typeof MessageInput>>
+  ) {
+    // The draft as the composer itself would have stored it while typing.
+    saveMessageInputDraftV2(DRAFT_KEY, {
+      type: "doc",
+      content: [{ type: "paragraph", content: [{ type: "text", text: "12" }] }],
+    })
+    const view = render(tree(props))
+    await waitFor(() => expect(composerHandle.current?.getText()).toBe("12"), {
+      timeout: 5000,
+    })
+    const editor = composerHandle.current?.getEditor()
+    if (!editor) throw new Error("composer editor not mounted")
+    return { view, editor }
+  }
+
+  it("holds the message in the composer and says why, instead of sending it", async () => {
+    const onSend = vi.fn()
+    const { editor } = await mountWithDraft({ onSend, isPrompting: true })
+
+    pressEnter(editor)
+
+    expect(onSend).not.toHaveBeenCalled()
+    expect(composerHandle.current?.getText()).toBe("12")
+    // Nor is the stored draft dropped, as a send drops it.
+    expect(loadMessageInputDraftV2(DRAFT_KEY)).not.toBeNull()
+    expect(toast.info).toHaveBeenCalledWith(MI.heldWhileResponding, {
+      id: expect.any(String),
+    })
+  })
+
+  it("sends the held message once the turn is over", async () => {
+    const onSend = vi.fn()
+    const { view, editor } = await mountWithDraft({ onSend, isPrompting: true })
+    pressEnter(editor)
+    expect(onSend).not.toHaveBeenCalled()
+
+    view.rerender(tree({ onSend, isPrompting: false }))
+    pressEnter(editor)
+
+    expect(onSend).toHaveBeenCalledTimes(1)
+    expect(onSend.mock.calls[0][0]).toEqual({
+      blocks: [{ type: "text", text: "12" }],
+      displayText: "12",
+    })
+    expect(composerHandle.current?.getText()).toBe("")
+  })
+
+  it("says nothing for an empty composer", async () => {
+    const onSend = vi.fn()
+    render(tree({ onSend, isPrompting: true }))
+    await waitFor(
+      () => expect(composerHandle.current?.getEditor()).toBeTruthy(),
+      { timeout: 5000 }
+    )
+
+    pressEnter(composerHandle.current!.getEditor()!)
+
+    expect(onSend).not.toHaveBeenCalled()
+    expect(toast.info).not.toHaveBeenCalled()
+  })
+
+  it("still queues it where the surface has a queue", async () => {
+    const onSend = vi.fn()
+    const onEnqueue = vi.fn()
+    const { editor } = await mountWithDraft({
+      onSend,
+      onEnqueue,
+      isPrompting: true,
+    })
+
+    pressEnter(editor)
+
+    expect(onEnqueue).toHaveBeenCalledTimes(1)
+    expect(onSend).not.toHaveBeenCalled()
+    expect(toast.info).not.toHaveBeenCalled()
+    expect(composerHandle.current?.getText()).toBe("")
   })
 })
 
@@ -2908,5 +3219,176 @@ describe("MessageInput predicted follow-up prompt", () => {
       expect(composerHandle.current!.isEmpty()).toBe(true)
       unmount()
     }
+  })
+})
+
+// The tab store closes a draft tab only when it holds nothing. What a saved
+// draft cannot show — typing still inside the save debounce, an image
+// attachment (never saved) — the mounted composer reports itself.
+describe("MessageInput live content for draft tidying", () => {
+  const draftKey = "draft:live-content"
+  afterEach(() => {
+    cleanup()
+    composerHandle.current = null
+    clearMessageInputDraftV2(draftKey)
+  })
+
+  function tree(props: Partial<React.ComponentProps<typeof MessageInput>>) {
+    return (
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <MessageInput
+          onSend={vi.fn()}
+          promptCapabilities={CAPS}
+          draftStorageKey={draftKey}
+          {...props}
+        />
+      </NextIntlClientProvider>
+    )
+  }
+
+  it("reports typed text and image attachments until the composer goes", async () => {
+    const view = render(tree({}))
+    await waitFor(
+      () => expect(composerHandle.current?.getEditor()).toBeTruthy(),
+      { timeout: 5000 }
+    )
+    const editor = composerHandle.current!.getEditor()!
+    expect(hasLiveComposerContent(draftKey)).toBe(false)
+
+    act(() => {
+      editor.commands.insertContent("half a thought")
+    })
+    await waitFor(() => expect(hasLiveComposerContent(draftKey)).toBe(true))
+    act(() => {
+      editor.commands.clearContent(true)
+    })
+    await waitFor(() => expect(hasLiveComposerContent(draftKey)).toBe(false))
+
+    // An image alone, no text.
+    view.rerender(
+      tree({
+        injectContent: {
+          handBack: [{ type: "image", data: "aGk=", mime_type: "image/png" }],
+        },
+      })
+    )
+    expect(await screen.findByAltText("image.png")).toBeInTheDocument()
+    await waitFor(() => expect(hasLiveComposerContent(draftKey)).toBe(true))
+
+    view.unmount()
+    expect(hasLiveComposerContent(draftKey)).toBe(false)
+  })
+
+  // A dropped image is read before it shows: from the drop on, the draft
+  // already counts as holding content, not only once the thumbnail commits.
+  it("reports a file intake the moment it starts, before its content commits", async () => {
+    const { container } = render(tree({}))
+    await waitFor(
+      () => expect(composerHandle.current?.getEditor()).toBeTruthy(),
+      { timeout: 5000 }
+    )
+    const host = container.firstElementChild as HTMLElement
+    const image = new File([new Uint8Array([137, 80, 78, 71])], "shot.png", {
+      type: "image/png",
+    })
+    expect(hasLiveComposerContent(draftKey)).toBe(false)
+
+    // Dispatched outside act(): React must not get to commit (and run the
+    // composer's effects) before the assertion, as it would not in a browser.
+    const drop = new Event("drop", { bubbles: true, cancelable: true })
+    Object.defineProperty(drop, "dataTransfer", {
+      value: { files: [image], types: ["Files"], items: [] },
+    })
+    host.dispatchEvent(drop)
+    // Synchronously, with the file still being read.
+    expect(screen.queryByAltText("shot.png")).toBeNull()
+    expect(hasLiveComposerContent(draftKey)).toBe(true)
+
+    expect(await screen.findByAltText("shot.png")).toBeInTheDocument()
+    await waitFor(() => expect(hasLiveComposerContent(draftKey)).toBe(true))
+  })
+
+  describe("a context-menu paste", () => {
+    let finishRead: ((text: string) => void) | null = null
+    function setClipboard(readText: () => Promise<string>) {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { readText, read: async () => [], writeText: async () => {} },
+      })
+    }
+    async function openPasteItem() {
+      render(tree({}))
+      await waitFor(
+        () => expect(composerHandle.current?.getEditor()).toBeTruthy(),
+        { timeout: 5000 }
+      )
+      const surface = document.querySelector<HTMLElement>(".ProseMirror")!
+      fireEvent.contextMenu(surface, { clientX: 40, clientY: 12 })
+      return screen.findByRole("menuitem", { name: "Paste as plain text" })
+    }
+
+    it("counts as content on its way from the first clipboard read", async () => {
+      setClipboard(
+        () =>
+          new Promise<string>((resolve) => {
+            finishRead = resolve
+          })
+      )
+      const paste = await openPasteItem()
+      fireEvent.click(paste)
+      // The read has not answered yet: nothing in the composer, but it counts.
+      expect(hasLiveComposerContent(draftKey)).toBe(true)
+      // An empty clipboard: nothing lands, and the mark goes with the paste.
+      await act(async () => {
+        finishRead?.("")
+      })
+      await waitFor(() => expect(hasLiveComposerContent(draftKey)).toBe(false))
+    })
+  })
+
+  // A pasted image the hook drops at once (here an empty one): the intake
+  // starts and settles with nothing, and the mark set at its start goes.
+  it("lets go of an intake that brought nothing", async () => {
+    render(tree({}))
+    await waitFor(
+      () => expect(composerHandle.current?.getEditor()).toBeTruthy(),
+      { timeout: 5000 }
+    )
+    const surface = document.querySelector<HTMLElement>(".ProseMirror")!
+    const empty = new File([], "empty.png", { type: "image/png" })
+    const paste = new Event("paste", { bubbles: true, cancelable: true })
+    Object.defineProperty(paste, "clipboardData", {
+      value: {
+        files: [empty],
+        items: [],
+        types: ["Files"],
+        getData: () => "",
+      },
+    })
+    surface.dispatchEvent(paste)
+    // The intake did start (and marked the draft at once)…
+    expect(hasLiveComposerContent(draftKey)).toBe(true)
+    // …and once it has settled with nothing, the mark goes.
+    await waitFor(() => expect(hasLiveComposerContent(draftKey)).toBe(false))
+  })
+
+  // Started and settled before React renders (an intake begun outside an
+  // event that finds nothing to do): `intakePending` reads false both times,
+  // so only the revision makes the composer report again — without it, the
+  // mark set at the start would protect a blank draft for good.
+  it("lets go of an intake that started and settled within one render", async () => {
+    render(tree({}))
+    await waitFor(
+      () => expect(composerHandle.current?.getEditor()).toBeTruthy(),
+      { timeout: 5000 }
+    )
+    let markedAtStart = false
+    act(() => {
+      const settle = attachmentsCapture.current!.beginIntake()
+      markedAtStart = hasLiveComposerContent(draftKey)
+      settle()
+    })
+    expect(markedAtStart).toBe(true)
+    await waitFor(() => expect(hasLiveComposerContent(draftKey)).toBe(false))
   })
 })

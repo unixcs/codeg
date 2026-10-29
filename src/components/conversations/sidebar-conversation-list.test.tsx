@@ -30,6 +30,10 @@ import {
   useAppWorkspaceStore,
 } from "@/stores/app-workspace-store"
 import enMessages from "@/i18n/messages/en.json"
+import {
+  resetFolderTabsStore,
+  useFolderTabsStore,
+} from "@/stores/folder-tabs-store"
 
 // ── Probes ────────────────────────────────────────────────────────────────
 // AgentIcon renders once per card body → counts card re-renders. The Folder /
@@ -1114,6 +1118,91 @@ describe("SidebarConversationList — worktree grouping (Show worktrees)", () =>
     expect(probes.folder).toBe(0)
     expect(probes.root).toBe(0)
   })
+
+  describe("while tabs follow the folder", () => {
+    beforeEach(() => resetFolderTabsStore())
+    afterEach(() => resetFolderTabsStore())
+
+    // The container's header and its root row both carry the repo's id; the
+    // worktree's header carries its own.
+    const containerHeader = () =>
+      document.querySelectorAll<HTMLElement>('[data-folder-id="1"]')[0]!
+    const rootHeader = () =>
+      document.querySelectorAll<HTMLElement>('[data-folder-id="1"]')[1]
+    const worktreeHeader = () =>
+      document.querySelector<HTMLElement>('[data-folder-id="2"]')
+    const marked = (header: HTMLElement | null | undefined) =>
+      header?.parentElement?.hasAttribute("data-scope-selected") ?? false
+
+    it("marks the root row, not the container above it, for the repo's own scope", () => {
+      act(() => {
+        useFolderTabsStore.setState({ enabled: true, scope: 1 })
+      })
+      render(wtTree(true))
+      expect(marked(rootHeader())).toBe(true)
+      expect(rootHeader()).toHaveAttribute("aria-current", "true")
+      expect(marked(containerHeader())).toBe(false)
+      expect(containerHeader()).not.toHaveAttribute("aria-current")
+
+      act(() => {
+        fireEvent.click(worktreeHeader()!)
+      })
+      expect(useFolderTabsStore.getState().scope).toBe(2)
+      expect(marked(worktreeHeader())).toBe(true)
+      expect(marked(rootHeader())).toBe(false)
+      // Selecting the container still selects its main worktree — the root
+      // row — and the container stays unmarked.
+      act(() => {
+        fireEvent.click(containerHeader())
+      })
+      expect(useFolderTabsStore.getState().scope).toBe(1)
+      expect(marked(rootHeader())).toBe(true)
+      expect(marked(containerHeader())).toBe(false)
+      expect(marked(worktreeHeader())).toBe(false)
+
+      act(() => {
+        fireEvent.click(rootHeader()!)
+      })
+      expect(useFolderTabsStore.getState().scope).toBe(1)
+      expect(marked(rootHeader())).toBe(true)
+      expect(marked(containerHeader())).toBe(false)
+    })
+
+    it("marks a folded container for the scope folded away inside it", () => {
+      act(() => {
+        useFolderTabsStore.setState({ enabled: true, scope: 2 })
+      })
+      render(wtTree(true))
+      expect(marked(containerHeader())).toBe(false)
+      // Fold the container: its disclosure button sits right after its row
+      // button.
+      act(() => {
+        fireEvent.click(containerHeader().nextElementSibling as HTMLElement)
+      })
+      expect(worktreeHeader()).toBeNull()
+      expect(rootHeader()).toBeUndefined()
+      expect(marked(containerHeader())).toBe(true)
+
+      act(() => {
+        useFolderTabsStore.setState({ scope: 1 })
+      })
+      expect(marked(containerHeader())).toBe(true)
+      act(() => {
+        useFolderTabsStore.setState({ scope: "global" })
+      })
+      expect(marked(containerHeader())).toBe(false)
+
+      // Unfolded, the rows that show the scopes take the mark back.
+      act(() => {
+        fireEvent.click(containerHeader().nextElementSibling as HTMLElement)
+      })
+      act(() => {
+        useFolderTabsStore.setState({ scope: 1 })
+      })
+      expect(marked(rootHeader())).toBe(true)
+      expect(marked(containerHeader())).toBe(false)
+    })
+  })
 })
 
 describe("SidebarConversationList — Recent section", () => {
@@ -1197,11 +1286,53 @@ describe("SidebarConversationList — Recent section", () => {
     ).toHaveLength(2)
   })
 
+  it("orders by last activity even though the sidebar sorts by creation time", () => {
+    // The list under test is `sortMode="created"`. conv-11 was created first
+    // but touched last; conv-12 is newer but idle. A section called "Recent"
+    // must lead with conv-11 and show its activity stamp, not its birth date.
+    // Timestamps hang off the real clock: this suite runs on real timers.
+    const t0 = Date.now()
+    // The collapse test above persists `{recent: true}` into
+    // `workspace:sidebar-section-collapsed`, and the list hydrates from it.
+    localStorage.clear()
+    useAppWorkspaceStore.setState({
+      conversations: [
+        conv(11, 1, {
+          created_at: new Date(t0 - 5 * MINUTE).toISOString(),
+          updated_at: new Date(t0 - 30_000).toISOString(),
+        }),
+        conv(12, 1, {
+          created_at: new Date(t0 - 4 * MINUTE).toISOString(),
+          updated_at: new Date(t0 - 3 * MINUTE).toISOString(),
+        }),
+      ],
+    })
+    render(recentTree(true))
+
+    // The Folders section emits the canonical copies first (creation order:
+    // conv-12 is newer); everything after them is the Recent duplicate, in
+    // activity order (conv-11 was touched last). Each row's text is its title
+    // followed by its age label: the Folders copies keep their creation age
+    // ("4m", "5m"), while the Recent copies read their last activity ("now"
+    // for 30s ago, "3m"), so each row's position is explained by what it shows.
+    const rows = Array.from(document.querySelectorAll("[data-conv-key]"))
+    expect(rows.map((el) => el.textContent)).toEqual([
+      "conv-124m",
+      "conv-115m",
+      "conv-11now",
+      "conv-123m",
+    ])
+  })
+
   describe("paging", () => {
     // `recentLimit` starts at RECENT_PAGE_SIZE and only ever grew, so a list
     // expanded a few pages deep stayed that way for the rest of the session.
     // These cover the way back out.
-    const PAGE = 15
+    //
+    // A literal rather than the constant: ten rows a page is the product
+    // decision these assertions pin, so a changed page size has to be a
+    // deliberate edit here too.
+    const PAGE = 10
     const TOTAL = PAGE + 4
 
     // Recent duplicates every canonical row, so total cards = canonical + recent
@@ -1432,6 +1563,68 @@ describe("SidebarConversationList — Recent section", () => {
       expect(cardsFor(11)).toBe(2)
       expect(cardsFor(12)).toBe(2)
     })
+  })
+})
+
+describe("SidebarConversationList — time labels", () => {
+  beforeEach(() => {
+    // Section collapse and folder expansion persist across tests otherwise.
+    localStorage.clear()
+    const folders = [folder(1, "Repo")]
+    store.activeTabId = null
+    store.tabSpec = []
+    useAppWorkspaceStore.setState({ folders, allFolders: folders })
+  })
+
+  it("labels Chat rows with the last activity they are ordered by", () => {
+    // The list under test is `sortMode="created"`, and Chat orders by last
+    // activity regardless. Timestamps hang off the real clock: this suite runs
+    // on real timers, and the list's `now` is read at mount.
+    const t0 = Date.now()
+    const HOUR = 60 * MINUTE
+    useAppWorkspaceStore.setState({
+      conversations: [
+        // Started two days ago, used 30s ago: Chat lists it first.
+        conv(21, 99, {
+          kind: "chat",
+          created_at: new Date(t0 - 48 * HOUR).toISOString(),
+          updated_at: new Date(t0 - 30_000).toISOString(),
+        }),
+        conv(22, 99, {
+          kind: "chat",
+          created_at: new Date(t0 - HOUR).toISOString(),
+          updated_at: new Date(t0 - HOUR).toISOString(),
+        }),
+        // Pinned (ordered by pin time) and Folders (ordered by creation here)
+        // keep the creation age.
+        conv(23, 99, {
+          kind: "chat",
+          created_at: new Date(t0 - 3 * HOUR).toISOString(),
+          updated_at: new Date(t0 - 30_000).toISOString(),
+          pinned_at: new Date(t0 - 30_000).toISOString(),
+        }),
+        conv(24, 1, {
+          created_at: new Date(t0 - 5 * MINUTE).toISOString(),
+          updated_at: new Date(t0 - 30_000).toISOString(),
+        }),
+      ],
+    })
+    render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <SidebarConversationList showCompleted sortMode="created" />
+      </NextIntlClientProvider>
+    )
+
+    // Pinned, Folders, then Chat; each row's text is its title followed by
+    // its age label. Chat reads "now" above "1h" (its order), not "2d" above
+    // "1h".
+    const rows = Array.from(document.querySelectorAll("[data-conv-key]"))
+    expect(rows.map((el) => el.textContent)).toEqual([
+      "conv-233h",
+      "conv-245m",
+      "conv-21now",
+      "conv-221h",
+    ])
   })
 })
 
@@ -2062,5 +2255,78 @@ describe("SidebarConversationList — tag filter", () => {
     })
     expect(probes.card).toBe(1)
     expect(probes.folder).toBe(0)
+  })
+})
+
+describe("SidebarConversationList — folder header and folder-tabs mode", () => {
+  beforeEach(() => {
+    const folders = [folder(1, "Folder 1"), folder(2, "Folder 2")]
+    useAppWorkspaceStore.setState({
+      folders,
+      allFolders: folders,
+      conversations: [conv(11, 1), conv(21, 2)],
+    })
+    store.activeTabId = null
+    store.tabSpec = []
+    resetFolderTabsStore()
+  })
+  afterEach(() => resetFolderTabsStore())
+
+  const header = (folderId: number) =>
+    document.querySelector(`[data-folder-id="${folderId}"]`) as HTMLElement
+  const disclosureButtons = () =>
+    document.querySelectorAll('[aria-label="Expand or collapse folder"]')
+
+  it("normal mode keeps the row button as the disclosure, with no extra button", () => {
+    render(tree())
+    const before = header(1).getAttribute("aria-expanded")
+    expect(before === "true" || before === "false").toBe(true)
+    expect(header(1)).not.toHaveAttribute("aria-current")
+    expect(header(1).parentElement).not.toHaveAttribute("data-scope-selected")
+    expect(disclosureButtons()).toHaveLength(0)
+    act(() => {
+      fireEvent.click(header(1))
+    })
+    expect(header(1)).toHaveAttribute(
+      "aria-expanded",
+      before === "true" ? "false" : "true"
+    )
+    expect(useFolderTabsStore.getState().scope).toBe("global")
+  })
+
+  it("folder-tabs mode: the row selects the folder, a separate chevron button toggles it", () => {
+    act(() => {
+      useFolderTabsStore.setState({ enabled: true, scope: 2 })
+    })
+    render(tree())
+    expect(header(1)).not.toHaveAttribute("aria-expanded")
+    expect(header(2)).toHaveAttribute("aria-current", "true")
+    // The folder on screen wears the selected-row tint, not only the ARIA.
+    const row = (folderId: number) => header(folderId).parentElement!
+    expect(row(2)).toHaveAttribute("data-scope-selected", "true")
+    expect(row(2).className).toContain("bg-sidebar-primary/8")
+    expect(row(1)).not.toHaveAttribute("data-scope-selected")
+    expect(row(1).className).not.toContain("bg-sidebar-primary/8")
+    act(() => {
+      fireEvent.click(header(1))
+    })
+    expect(useFolderTabsStore.getState().scope).toBe(1)
+    expect(header(1)).toHaveAttribute("aria-current", "true")
+    expect(row(1)).toHaveAttribute("data-scope-selected", "true")
+    expect(row(2)).not.toHaveAttribute("data-scope-selected")
+    // The row's own disclosure button sits right after the row button.
+    const toggle = () => header(1).nextElementSibling as HTMLElement
+    expect(toggle()).toHaveAttribute("aria-label", "Expand or collapse folder")
+    expect(disclosureButtons()).toHaveLength(2)
+    const before = toggle().getAttribute("aria-expanded")
+    expect(before === "true" || before === "false").toBe(true)
+    act(() => {
+      fireEvent.click(toggle())
+    })
+    expect(toggle()).toHaveAttribute(
+      "aria-expanded",
+      before === "true" ? "false" : "true"
+    )
+    expect(useFolderTabsStore.getState().scope).toBe(1)
   })
 })
