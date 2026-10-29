@@ -18,7 +18,7 @@ import { useAuxPanelContext } from "@/contexts/aux-panel-context"
 import { useTerminalContext } from "@/contexts/terminal-context"
 import { useSortedAvailableAgents } from "@/hooks/use-sorted-available-agents"
 import { useTabActions, useTabStore } from "@/contexts/tab-context"
-import { requestCreateTaskFromText } from "@/lib/task-compose-events"
+import { openTaskFromMessage } from "@/lib/task-from-message"
 import { requestRenameConversation } from "@/lib/rename-conversation-events"
 import {
   requestDeleteConversation,
@@ -141,7 +141,11 @@ export function WorkspaceChromeController() {
   // no active folder means there is nothing to reveal (same guard as the
   // toggle-files keyboard shortcut below).
   const auxPanel = useAuxPanelContext()
-  const activeTab = tabs.find((tab) => tab.id === activeTabId)
+  // Upstream 0.41 narrowed `tabs` to the visible conversation tabs (its tab
+  // shortcuts only act on those). The floating ball's actions are window-wide:
+  // they must still find the active tab while another folder is being shown,
+  // so they read the unfiltered list instead.
+  const activeTab = rawTabs.find((tab) => tab.id === activeTabId)
   const { floatingBallFavoriteAgents: favoriteAgents } = useFloatingBall()
   // Search open-state is shared (see search-dialog-context): the trigger lives
   // in the sidebar, but this always-mounted controller owns the dialog and the
@@ -559,13 +563,13 @@ export function WorkspaceChromeController() {
           setRoute("tasks")
           return
         case "openTodosNew":
-          // Park the draft before switching — the Tasks page consumes it on
-          // mount, and on the live event when the route is already active.
-          requestCreateTaskFromText({
+          // Upstream 0.41 draws the task editor over the current page
+          // (TaskFromMessageHost) instead of parking a draft and switching to
+          // the To-dos route, so there is no route change here any more.
+          openTaskFromMessage({
             text: "",
             folderId: activeFolder?.id ?? null,
           })
-          setRoute("tasks")
           return
         case "openAutomations":
           setRoute("automations")

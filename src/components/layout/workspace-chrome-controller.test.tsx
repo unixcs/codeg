@@ -51,12 +51,16 @@ const spies = vi.hoisted(() => ({
   confirmDraftAgent: vi.fn(),
   openChatModeTab: vi.fn(),
   openNewConversationTab: vi.fn(),
+  openTaskFromMessage: vi.fn(),
 }))
 
 /** Captured from the (stubbed) FloatingBall: the controller's action handler. */
 let ballAction: ((action: string) => void) | null = null
 
 vi.mock("@/lib/api", () => ({ openSettingsWindow: spies.openSettingsWindow }))
+vi.mock("@/lib/task-from-message", () => ({
+  openTaskFromMessage: spies.openTaskFromMessage,
+}))
 vi.mock("next-intl", () => ({
   useTranslations: () => (key: string) => key,
 }))
@@ -481,14 +485,15 @@ describe("WorkspaceChromeController — floating-ball actions", () => {
     )
   })
 
-  it("opens the new-to-do composer even when the tasks route is already active", () => {
-    const received: CustomEvent[] = []
-    const listener = (e: Event) => received.push(e as CustomEvent)
-    window.addEventListener("codeg:create-task-from-text", listener)
+  it("opens the new-to-do composer over the current page", () => {
     fire("openTodosNew")
-    window.removeEventListener("codeg:create-task-from-text", listener)
-    expect(spies.setRoute).toHaveBeenCalledWith("tasks")
-    expect(received).toHaveLength(1)
+    // Upstream 0.41 draws the task editor over whatever is on screen instead
+    // of switching to the To-dos route, so the folder is what gets carried in.
+    expect(spies.openTaskFromMessage).toHaveBeenCalledWith({
+      text: "",
+      folderId: 1,
+    })
+    expect(spies.setRoute).not.toHaveBeenCalledWith("tasks")
   })
 
   it("renames the active tab's conversation by id", () => {
