@@ -5880,9 +5880,16 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // conversation in `~/.zcode/v2/acp-closed-sessions.json`, which only
             // a `session/load` whose `_meta.zcode.intent` is `"auto"` consults,
             // and codeg sends no intent.
+            // FORK: 这里刻意不跟随上游升到 0.79.1。本机全局装的
+            // zcode-acp-server@0.72.0 是打过本地补丁的（rememberAccountModels /
+            // appendAccountCachedModels / storeStartPlanJwt），账号免费的
+            // GLM-5.3-Flash 正是靠它出现在模型下拉里；0.79.1 的 codingPlanRequestAuthFor
+            // 明确拒绝 start-plan 鉴权（上游 issue #123），换上去这个功能就没了。
+            // 运行时用的是 PATH 上的全局包，pin 只影响设置页显示的目标版本与
+            // 一键安装的落点——留在 0.72.0 才不会有人顺手点升级把补丁冲掉。
             distribution: AgentDistribution::Npx {
-                version: "0.79.1",
-                package: "zcode-acp-server@0.79.1",
+                version: "0.72.0",
+                package: "zcode-acp-server@0.72.0",
                 cmd: "zcode-acp-server",
                 args: &["server"],
                 env: &[],
