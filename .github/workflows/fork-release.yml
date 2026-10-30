@@ -25,7 +25,6 @@ on:
 
 permissions:
   contents: write
-  issues: write
 
 concurrency:
   group: fork-release
@@ -113,14 +112,25 @@ jobs:
             echo "merged=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Open issue on merge conflict
+      - name: Report merge conflict (fails the run on purpose)
+        # Issues are disabled on this fork, so the old `gh issue create` could
+        # only ever fail: the red X it produced was the only signal and it
+        # carried no readable reason. Write the exact recovery steps into the
+        # run summary, then fail explicitly so the run still goes red.
         if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'false'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh issue create --repo "$GITHUB_REPOSITORY" \
-            --title "上游 ${{ steps.upstream.outputs.tag }} 合并冲突，需人工介入" \
-            --body "spacering-net/codeg 发布了 ${{ steps.upstream.outputs.tag }}，CI 合并进 deploy/fork-updater 时有冲突，本次未出包。请在本地：git fetch upstream && git merge ${{ steps.upstream.outputs.tag }}，解决冲突（保留悬浮球与 fork 更新源补丁）后 push 到 deploy 分支，然后手动重跑 workflow。"
+          {
+            echo "## ⚠️ 上游 ${{ steps.upstream.outputs.tag }} 合并冲突，本次未出包"
+            echo ""
+            echo '```bash'
+            echo "cd /mnt/Projects/codeg/repo && git fetch upstream --tags"
+            echo "git checkout deploy/fork-updater"
+            echo "git merge ${{ steps.upstream.outputs.tag }}"
+            echo "# 解决冲突（保住悬浮球与 fork 更新源补丁）→ push → 重跑本 workflow"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::上游 ${{ steps.upstream.outputs.tag }} 合并冲突，未出包——处理步骤见本次运行的 Summary"
+          exit 1
 
       - name: Stamp fork version into build inputs
         # CARGO_PKG_VERSION 是编译期烙进二进制的（update.rs 的 currentVersion），
@@ -149,12 +159,17 @@ jobs:
           assert lines[i + 1].startswith("version = "), f"unexpected lock layout at line {i}"
           lines[i + 1] = f'version = "{ver}"'
           open("src-tauri/Cargo.lock", "w").write("\n".join(lines))
+          # The version being replaced is whatever upstream shipped (0.38.0,
+          # 0.41.3, ...), so match the field itself instead of hard-coding a
+          # release number: a stale needle tripped the assert and killed the
+          # whole release without building anything.
+          import re
           for path in ("src-tauri/tauri.conf.json", "package.json"):
               text = open(path).read()
-              needle = '"version": "0.38.0"'
-              assert text.count(needle) == 1, f"expected one version field in {path}"
+              new, n = re.subn(r'("version"\s*:\s*)"[^"]*"', r'\1"' + ver + '"', text, count=1)
+              assert n == 1, f"no top-level version field in {path}"
               # spot replace keeps upstream's compact formatting intact
-              open(path, "w").write(text.replace(needle, f'"version": "{ver}"'))
+              open(path, "w").write(new)
           EOF
           grep "\"version\": \"${VER}\"" src-tauri/tauri.conf.json package.json
           grep -A1 '^name = "codeg"$' src-tauri/Cargo.lock | head -2
@@ -367,11 +382,16 @@ jobs:
           assert lines[i + 1].startswith("version = "), f"unexpected lock layout at line {i}"
           lines[i + 1] = f'version = "{ver}"'
           open("src-tauri/Cargo.lock", "w").write("\n".join(lines))
+          # The version being replaced is whatever upstream shipped (0.38.0,
+          # 0.41.3, ...), so match the field itself instead of hard-coding a
+          # release number: a stale needle tripped the assert and killed the
+          # whole release without building anything.
+          import re
           for path in ("src-tauri/tauri.conf.json", "package.json"):
               text = open(path).read()
-              needle = '"version": "0.38.0"'
-              assert text.count(needle) == 1, f"expected one version field in {path}"
-              open(path, "w").write(text.replace(needle, f'"version": "{ver}"'))
+              new, n = re.subn(r'("version"\s*:\s*)"[^"]*"', r'\1"' + ver + '"', text, count=1)
+              assert n == 1, f"no top-level version field in {path}"
+              open(path, "w").write(new)
           EOF
           grep "\"version\": \"${VER}\"" src-tauri/tauri.conf.json package.json
           grep -A1 '^name = "codeg"$' src-tauri/Cargo.lock | head -2
