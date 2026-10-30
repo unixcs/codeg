@@ -25,7 +25,6 @@ on:
 
 permissions:
   contents: write
-  issues: write
 
 concurrency:
   group: fork-release
@@ -36,6 +35,11 @@ env:
 
 jobs:
   sync-and-release:
+    # arm64 job 直接复用这里算出的 tag。让它自己再去 release 列表里猜"最新
+    # fork release"，上游换基版本时会猜中旧的 0.38.0+fork.7（fork 序号更大），
+    # 误判"arm64 已存在"而跳过，新 release 就永远缺 arm64 包，且整次运行全绿。
+    outputs:
+      tag: ${{ steps.forkver.outputs.tag }}
     if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.arm_only) }}
     runs-on: ubuntu-22.04
     timeout-minutes: 90
@@ -72,8 +76,12 @@ jobs:
           # patch (0.38.1 < 0.38.1001), keeps plain 3-part semver that Cargo
           # accepts, and stays readable as the upstream base.
           base="${{ steps.upstream.outputs.ver }}"
-          n=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-            --jq "[.[] | select(.tag_name | startswith(\"${base}+fork.\"))] | length" 2>/dev/null || echo 0)
+          minor="${base%.*}"
+          # 序号按整条 minor 线累计，而不是按基版本累计：0.41.3 出过 0.41.1001
+          # 之后上游发 0.41.4，若重新从 1 数就会再发一版 0.41.1001——已装机器
+          # is_newer 判 false，永远看不到这个包（静默停更）。
+          n=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[].tag_name' | grep -F "${minor}." | grep -cF "+fork." || true)
           n=$((n + 1))
           build=$((1000 + n))
           # strip the trailing ".0" (upstream .0 patch) so the build number
@@ -113,14 +121,67 @@ jobs:
             echo "merged=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Open issue on merge conflict
+      - name: Report merge conflict (fails the run on purpose)
+        # Issues are disabled on this fork, so the old `gh issue create` could
+        # only ever fail: the red X it produced was the only signal and it
+        # carried no readable reason. Write the exact recovery steps into the
+        # run summary, then fail explicitly so the run still goes red.
         if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'false'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh issue create --repo "$GITHUB_REPOSITORY" \
-            --title "上游 ${{ steps.upstream.outputs.tag }} 合并冲突，需人工介入" \
-            --body "spacering-net/codeg 发布了 ${{ steps.upstream.outputs.tag }}，CI 合并进 deploy/fork-updater 时有冲突，本次未出包。请在本地：git fetch upstream && git merge ${{ steps.upstream.outputs.tag }}，解决冲突（保留悬浮球与 fork 更新源补丁）后 push 到 deploy 分支，然后手动重跑 workflow。"
+          {
+            echo "## ⚠️ 上游 ${{ steps.upstream.outputs.tag }} 合并冲突，本次未出包"
+            echo ""
+            echo '```bash'
+            echo "cd /mnt/Projects/codeg/repo && git fetch upstream --tags"
+            echo "git checkout deploy/fork-updater"
+            echo "git merge ${{ steps.upstream.outputs.tag }}"
+            echo "# 解决冲突（保住悬浮球与 fork 更新源补丁）→ push → 重跑本 workflow"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::上游 ${{ steps.upstream.outputs.tag }} 合并冲突，未出包——处理步骤见本次运行的 Summary"
+          exit 1
+
+      - name: Stamp fork version into build inputs
+        # CARGO_PKG_VERSION 是编译期烙进二进制的（update.rs 的 currentVersion），
+        # 只在 latest.json 写版本号会让已装机器永远看到"有更新"。必须在
+        # cargo/pnpm 构建前把 forkver 写进版本源，二进制才真正自称新版本。
+        # Cargo.lock 同步改，避免 lock 校验失败；JSON 用定点替换保留上游紧凑排版。
+        # 顺序很关键：必须在 Build frontend 之前，否则网页包内联的
+        # CODEG_APP_VERSION（next.config.ts 读 package.json）仍是上游版本，
+        # 页面打开就报"服务器已运行 X，此页面仍是 Y"。
+        if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
+        env:
+          VER: ${{ steps.forkver.outputs.forkver }}
+        run: |
+          set -euo pipefail
+          sed -i "0,/^version = \".*\"/s//version = \"${VER}\"/" src-tauri/Cargo.toml
+          grep -q "^version = \"${VER}\"" src-tauri/Cargo.toml
+          python3 - "$VER" <<'EOF'
+          import sys
+          ver = sys.argv[1]
+          # Cargo.lock: bump the fork's own package entry — it's the only
+          # [[package]] named "codeg" (other crates carry a vendor prefix).
+          lines = open("src-tauri/Cargo.lock").read().split("\n")
+          hits = [i for i, line in enumerate(lines) if line == 'name = "codeg"']
+          assert len(hits) == 1, f'expected exactly one "codeg" entry, found {len(hits)}'
+          i = hits[0]
+          assert lines[i + 1].startswith("version = "), f"unexpected lock layout at line {i}"
+          lines[i + 1] = f'version = "{ver}"'
+          open("src-tauri/Cargo.lock", "w").write("\n".join(lines))
+          # The version being replaced is whatever upstream shipped (0.38.0,
+          # 0.41.3, ...), so match the field itself instead of hard-coding a
+          # release number: a stale needle tripped the assert and killed the
+          # whole release without building anything.
+          import re
+          for path in ("src-tauri/tauri.conf.json", "package.json"):
+              text = open(path).read()
+              new, n = re.subn(r'("version"\s*:\s*)"[^"]*"', r'\1"' + ver + '"', text, count=1)
+              assert n == 1, f"no top-level version field in {path}"
+              # spot replace keeps upstream's compact formatting intact
+              open(path, "w").write(new)
+          EOF
+          grep "\"version\": \"${VER}\"" src-tauri/tauri.conf.json package.json
+          grep -A1 '^name = "codeg"$' src-tauri/Cargo.lock | head -2
 
       - name: Install pnpm deps
         if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
@@ -151,40 +212,6 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - name: Stamp fork version into build inputs
-        # CARGO_PKG_VERSION 是编译期烙进二进制的（update.rs 的 currentVersion），
-        # 只在 latest.json 写版本号会让已装机器永远看到"有更新"。必须在
-        # cargo/pnpm 构建前把 forkver 写进版本源，二进制才真正自称新版本。
-        # Cargo.lock 同步改，避免 lock 校验失败；JSON 用定点替换保留上游紧凑排版。
-        if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
-        env:
-          VER: ${{ steps.forkver.outputs.forkver }}
-        run: |
-          set -euo pipefail
-          sed -i "0,/^version = \".*\"/s//version = \"${VER}\"/" src-tauri/Cargo.toml
-          grep -q "^version = \"${VER}\"" src-tauri/Cargo.toml
-          python3 - "$VER" <<'EOF'
-          import sys
-          ver = sys.argv[1]
-          # Cargo.lock: bump the fork's own package entry — it's the only
-          # [[package]] named "codeg" (other crates carry a vendor prefix).
-          lines = open("src-tauri/Cargo.lock").read().split("\n")
-          hits = [i for i, line in enumerate(lines) if line == 'name = "codeg"']
-          assert len(hits) == 1, f'expected exactly one "codeg" entry, found {len(hits)}'
-          i = hits[0]
-          assert lines[i + 1].startswith("version = "), f"unexpected lock layout at line {i}"
-          lines[i + 1] = f'version = "{ver}"'
-          open("src-tauri/Cargo.lock", "w").write("\n".join(lines))
-          for path in ("src-tauri/tauri.conf.json", "package.json"):
-              text = open(path).read()
-              needle = '"version": "0.38.0"'
-              assert text.count(needle) == 1, f"expected one version field in {path}"
-              # spot replace keeps upstream's compact formatting intact
-              open(path, "w").write(text.replace(needle, f'"version": "{ver}"'))
-          EOF
-          grep "\"version\": \"${VER}\"" src-tauri/tauri.conf.json package.json
-          grep -A1 '^name = "codeg"$' src-tauri/Cargo.lock | head -2
-
       - name: Build server + companions (mirror official release.yml)
         if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
         run: |
@@ -213,6 +240,9 @@ jobs:
           test -x "dist/${ARTIFACT}/codeg-computer-helper"
           test -x "dist/${ARTIFACT}/codeg-cli"
           test -f "dist/${ARTIFACT}/web/index.html"
+          # 二进制必须自称 forkver。latest.json 说新、二进制说旧是这条流水线
+          # 最隐蔽的失败：已装机器永远看不到更新（CARGO_PKG_VERSION 编译期定死）。
+          "dist/${ARTIFACT}/codeg-server" --version | grep -qF "${{ steps.forkver.outputs.forkver }}"
 
       - name: Sign bundle with fork key
         if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
@@ -231,7 +261,12 @@ jobs:
           VER: ${{ steps.forkver.outputs.forkver }}
         run: |
           set -euo pipefail
-          SIG=$(base64 -w0 "dist/${ARTIFACT}.tar.gz.sig")
+          # `.sig` 本身就是 minisign 文本的 base64（tauri signer 的产物），
+          # 再 base64 一次就是双层编码：Tauri 桌面更新器解一次后拿到单行
+          # base64 而不是 4 行 minisign 文档，直接 InvalidEncoding。
+          # 服务器更新器不读这个字段（它另下 .sig 资产），所以只影响桌面端，
+          # 但保持与上游 latest.json 同一约定没有代价。
+          SIG=$(tr -d '\n\r' < "dist/${ARTIFACT}.tar.gz.sig")
           URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${{ steps.forkver.outputs.tag }}/${ARTIFACT}.tar.gz"
           jq -n --arg v "$VER" --arg s "$SIG" --arg u "$URL" --rawfile n /tmp/upstream-notes.md \
             '{version: $v, notes: $n, pub_date: (now | todateiso8601),
@@ -295,8 +330,17 @@ jobs:
           GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          tag=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=20" \
-            --jq '[.[] | select(.tag_name | contains("+fork."))] | sort_by(.created_at) | last | .tag_name')
+          # 主路：直接沿用 x64 job 算出的 tag，它就是本次要补 arm64 包的 release。
+          # 兜底（arm_only=true 时 x64 job 被 skip，output 为空）：先比上游基版本、
+          # 再比 fork 序号。只按 fork 序号排会选中 n 更大的旧基版本（0.38.0+fork.7），
+          # arm64 被误判"已存在"而跳过；也别按 created_at，同一提交时间相同，
+          # 稳定排序的 last 会取到旧版本（批v91 实锤）。jq 的数组比较是字典序，
+          # [0,41,3] > [0,38,0]，所以基版本优先。
+          tag="${{ needs.sync-and-release.outputs.tag }}"
+          if [ -z "$tag" ]; then
+            tag=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq '[.[] | select(.tag_name | contains("+fork."))] | sort_by([(.tag_name | split("+fork.")[0] | split(".") | map(tonumber)), (.tag_name | capture("fork\\.(?<n>[0-9]+)$").n | tonumber)]) | last | .tag_name')
+          fi
           test -n "$tag"
           gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
             --pattern latest.json --output /tmp/latest.json --clobber
@@ -362,11 +406,16 @@ jobs:
           assert lines[i + 1].startswith("version = "), f"unexpected lock layout at line {i}"
           lines[i + 1] = f'version = "{ver}"'
           open("src-tauri/Cargo.lock", "w").write("\n".join(lines))
+          # The version being replaced is whatever upstream shipped (0.38.0,
+          # 0.41.3, ...), so match the field itself instead of hard-coding a
+          # release number: a stale needle tripped the assert and killed the
+          # whole release without building anything.
+          import re
           for path in ("src-tauri/tauri.conf.json", "package.json"):
               text = open(path).read()
-              needle = '"version": "0.38.0"'
-              assert text.count(needle) == 1, f"expected one version field in {path}"
-              open(path, "w").write(text.replace(needle, f'"version": "{ver}"'))
+              new, n = re.subn(r'("version"\s*:\s*)"[^"]*"', r'\1"' + ver + '"', text, count=1)
+              assert n == 1, f"no top-level version field in {path}"
+              open(path, "w").write(new)
           EOF
           grep "\"version\": \"${VER}\"" src-tauri/tauri.conf.json package.json
           grep -A1 '^name = "codeg"$' src-tauri/Cargo.lock | head -2
@@ -421,6 +470,8 @@ jobs:
           test -x "dist/${ARTIFACT}/codeg-cli"
           test -f "dist/${ARTIFACT}/web/index.html"
           file "dist/${ARTIFACT}/codeg-server" | grep -q "ARM aarch64"
+          # 与 x64 job 同理：二进制必须自称 latest.json 里那个版本。
+          "dist/${ARTIFACT}/codeg-server" --version | grep -qF "${{ steps.rel.outputs.ver }}"
 
       - name: Sign bundle with fork key
         if: steps.rel.outputs.skip == 'false'
