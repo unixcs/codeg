@@ -35,6 +35,11 @@ env:
 
 jobs:
   sync-and-release:
+    # arm64 job 直接复用这里算出的 tag。让它自己再去 release 列表里猜"最新
+    # fork release"，上游换基版本时会猜中旧的 0.38.0+fork.7（fork 序号更大），
+    # 误判"arm64 已存在"而跳过，新 release 就永远缺 arm64 包，且整次运行全绿。
+    outputs:
+      tag: ${{ steps.forkver.outputs.tag }}
     if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.arm_only) }}
     runs-on: ubuntu-22.04
     timeout-minutes: 90
@@ -71,8 +76,12 @@ jobs:
           # patch (0.38.1 < 0.38.1001), keeps plain 3-part semver that Cargo
           # accepts, and stays readable as the upstream base.
           base="${{ steps.upstream.outputs.ver }}"
-          n=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-            --jq "[.[] | select(.tag_name | startswith(\"${base}+fork.\"))] | length" 2>/dev/null || echo 0)
+          minor="${base%.*}"
+          # 序号按整条 minor 线累计，而不是按基版本累计：0.41.3 出过 0.41.1001
+          # 之后上游发 0.41.4，若重新从 1 数就会再发一版 0.41.1001——已装机器
+          # is_newer 判 false，永远看不到这个包（静默停更）。
+          n=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[].tag_name' | grep -F "${minor}." | grep -cF "+fork." || true)
           n=$((n + 1))
           build=$((1000 + n))
           # strip the trailing ".0" (upstream .0 patch) so the build number
@@ -231,6 +240,9 @@ jobs:
           test -x "dist/${ARTIFACT}/codeg-computer-helper"
           test -x "dist/${ARTIFACT}/codeg-cli"
           test -f "dist/${ARTIFACT}/web/index.html"
+          # 二进制必须自称 forkver。latest.json 说新、二进制说旧是这条流水线
+          # 最隐蔽的失败：已装机器永远看不到更新（CARGO_PKG_VERSION 编译期定死）。
+          "dist/${ARTIFACT}/codeg-server" --version | grep -qF "${{ steps.forkver.outputs.forkver }}"
 
       - name: Sign bundle with fork key
         if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
@@ -249,7 +261,12 @@ jobs:
           VER: ${{ steps.forkver.outputs.forkver }}
         run: |
           set -euo pipefail
-          SIG=$(base64 -w0 "dist/${ARTIFACT}.tar.gz.sig")
+          # `.sig` 本身就是 minisign 文本的 base64（tauri signer 的产物），
+          # 再 base64 一次就是双层编码：Tauri 桌面更新器解一次后拿到单行
+          # base64 而不是 4 行 minisign 文档，直接 InvalidEncoding。
+          # 服务器更新器不读这个字段（它另下 .sig 资产），所以只影响桌面端，
+          # 但保持与上游 latest.json 同一约定没有代价。
+          SIG=$(tr -d '\n\r' < "dist/${ARTIFACT}.tar.gz.sig")
           URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${{ steps.forkver.outputs.tag }}/${ARTIFACT}.tar.gz"
           jq -n --arg v "$VER" --arg s "$SIG" --arg u "$URL" --rawfile n /tmp/upstream-notes.md \
             '{version: $v, notes: $n, pub_date: (now | todateiso8601),
@@ -313,10 +330,17 @@ jobs:
           GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # 按 fork 序号排序，别按 created_at：fork.6 与 fork.7 的 created_at 相同（同一提交时间），
-          # sort_by 是稳定排序，last 会取到列表里靠后的旧版本（批v91 实锤：arm64 被误判"已存在"而跳过）。
-          tag=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=20" \
-            --jq '[.[] | select(.tag_name | contains("+fork."))] | sort_by(.tag_name | capture("fork\\.(?<n>[0-9]+)$").n | tonumber) | last | .tag_name')
+          # 主路：直接沿用 x64 job 算出的 tag，它就是本次要补 arm64 包的 release。
+          # 兜底（arm_only=true 时 x64 job 被 skip，output 为空）：先比上游基版本、
+          # 再比 fork 序号。只按 fork 序号排会选中 n 更大的旧基版本（0.38.0+fork.7），
+          # arm64 被误判"已存在"而跳过；也别按 created_at，同一提交时间相同，
+          # 稳定排序的 last 会取到旧版本（批v91 实锤）。jq 的数组比较是字典序，
+          # [0,41,3] > [0,38,0]，所以基版本优先。
+          tag="${{ needs.sync-and-release.outputs.tag }}"
+          if [ -z "$tag" ]; then
+            tag=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq '[.[] | select(.tag_name | contains("+fork."))] | sort_by([(.tag_name | split("+fork.")[0] | split(".") | map(tonumber)), (.tag_name | capture("fork\\.(?<n>[0-9]+)$").n | tonumber)]) | last | .tag_name')
+          fi
           test -n "$tag"
           gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
             --pattern latest.json --output /tmp/latest.json --clobber
@@ -446,6 +470,8 @@ jobs:
           test -x "dist/${ARTIFACT}/codeg-cli"
           test -f "dist/${ARTIFACT}/web/index.html"
           file "dist/${ARTIFACT}/codeg-server" | grep -q "ARM aarch64"
+          # 与 x64 job 同理：二进制必须自称 latest.json 里那个版本。
+          "dist/${ARTIFACT}/codeg-server" --version | grep -qF "${{ steps.rel.outputs.ver }}"
 
       - name: Sign bundle with fork key
         if: steps.rel.outputs.skip == 'false'
