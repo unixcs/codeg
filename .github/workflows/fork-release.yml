@@ -1,25 +1,31 @@
 name: Fork release (auto-sync upstream)
 
 # 当上游 spacering-net/codeg 发布新 release 时自动：
-#   1. 在 CI 里把上游 tag 合并进 deploy/fork-updater（含 fork 更新源补丁+悬浮球）
-#   2. 构建 linux-x64 服务端包（codeg-server + codeg-mcp + codeg-cli
-#      + codeg-computer-helper + web 静态资产），与官方 tarball 同构
-#   3. 用 fork 自己的 minisign 密钥签名（--app-version 绑定版本）
-#   4. 生成 latest.json 并连同 tarball/.sig/.sha256 发到 fork 的同名 release
-# tx/dell 上的 codeg 检查的是 fork 的 releases/latest，走它自带的一键更新。
+#   1. 定时（每 6 小时）+ dispatch 检查上游 latest；同一上游基版本只发一次
+#   2. 在 CI 里把上游 tag 合并进 deploy/fork-updater（含 ZCode 补丁+fork 更新源）
+#   3. 干净合并后回写 deploy/fork-updater（保留 fork 自己的 workflows）
+#   4. 构建 linux-x64/arm64 服务端包，用 fork 自己的 minisign 密钥签名，
+#      生成 latest.json 并连同 tarball/.sig/.sha256 发到 fork 同名 release
+# tx/nas/dell 上的 codeg 检查 fork 的 releases/latest，走自带的一键更新。
 #
-# 注意：合并结果**不回推** deploy 分支——GITHUB_TOKEN 无 workflows 权限，
-# 合并若带入 .github/workflows 改动，push 必被拒。deploy 分支的源码由
-# 人工维护（上游合并有冲突时本地解决后 push），CI 每次都从上游 tag 现合。
-# 冲突时合并失败 → job 标红 + 开 issue 通知，需人工解决。
+# 注意：合并时恢复 fork 自己的 .github/workflows，避免把上游 workflow 改动
+# 带进 push（也省掉 workflow scope 依赖）。冲突时 job 标红，Summary 里有
+# 可直接粘贴的恢复命令，需人工解决。
 
 on:
+  schedule:
+    # 每 6 小时主动查一次上游；比依赖 NAS 的 repository_dispatch 稳。
+    - cron: '0 */6 * * *'
   repository_dispatch:
     types: [upstream-release]
   workflow_dispatch:
     inputs:
       arm_only:
         description: "只给最新 fork release 补 arm64 包（跳过 x64 重建）"
+        type: boolean
+        default: false
+      force:
+        description: "上游基版本已发过也强制重建（默认跳过）"
         type: boolean
         default: false
 
@@ -89,22 +95,29 @@ jobs:
           forkver="${base%.*}.${build}"
           echo "forkver=$forkver" >> "$GITHUB_OUTPUT"
           echo "tag=${base}+fork.${n}" >> "$GITHUB_OUTPUT"
-          echo "Fork version: $forkver (tag ${base}+fork.${n}, build #$n)"
+          # Idempotency: a schedule run must not publish a new build every 6h.
+          # N is cumulative across the minor line, so the next N never exists;
+          # key the skip on the upstream BASE instead.
+          base_has=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[].tag_name' | grep -cF "${base}+fork." || true)
+          echo "base_has=$base_has" >> "$GITHUB_OUTPUT"
+          echo "Fork version: $forkver (tag ${base}+fork.${n}, build #$n, base releases #$base_has)"
 
-      - name: Skip if fork already has this release
+      - name: Skip if this upstream base already has a fork release
         id: skip
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if gh release view "${{ steps.forkver.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          # N is cumulative across the minor line, so `${base}+fork.${n}` is
+          # always new and can never detect a repeat. Skip when the upstream
+          # BASE already has any fork release, unless force=true.
+          if [ "${{ inputs.force }}" != "true" ] && [ "${{ steps.forkver.outputs.base_has }}" != "0" ]; then
             echo "already=true" >> "$GITHUB_OUTPUT"
-            echo "Release ${{ steps.forkver.outputs.tag }} already exists on fork — nothing to do."
+            echo "Upstream ${{ steps.upstream.outputs.ver }} already has a fork release — skipping (force=true to rebuild)."
           else
             echo "already=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Merge upstream tag (local only, not pushed back)
+      - name: Merge upstream tag
         if: steps.skip.outputs.already == 'false'
         id: merge
         run: |
@@ -113,13 +126,26 @@ jobs:
           git config user.email "bot@users.noreply.github.com"
           git remote add upstream https://github.com/spacering-net/codeg.git
           git fetch upstream "${{ steps.upstream.outputs.tag }}"
-          if git merge --no-edit FETCH_HEAD; then
+          if git merge --no-ff --no-edit FETCH_HEAD; then
             echo "merged=true" >> "$GITHUB_OUTPUT"
             git log --oneline -1
           else
             git merge --abort || true
             echo "merged=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Push the clean merge back to deploy branch
+        if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
+        run: |
+          set -euo pipefail
+          # Keep the fork's own workflows: upstream's .github changes would
+          # otherwise require a `workflow`-scoped token. Restore the pre-merge
+          # copy and amend the merge commit so the pushed tree never carries
+          # upstream workflows.
+          git checkout HEAD^1 -- .github/workflows
+          git add .github/workflows
+          git commit --amend --no-edit
+          git push origin HEAD:deploy/fork-updater
 
       - name: Report merge conflict (fails the run on purpose)
         # Issues are disabled on this fork, so the old `gh issue create` could
@@ -135,7 +161,7 @@ jobs:
             echo "cd /mnt/Projects/codeg/repo && git fetch upstream --tags"
             echo "git checkout deploy/fork-updater"
             echo "git merge ${{ steps.upstream.outputs.tag }}"
-            echo "# 解决冲突（保住悬浮球与 fork 更新源补丁）→ push → 重跑本 workflow"
+            echo "# 解决冲突（保住 ZCode 补丁与 fork 更新源补丁）→ push → 重跑本 workflow"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::error::上游 ${{ steps.upstream.outputs.tag }} 合并冲突，未出包——处理步骤见本次运行的 Summary"
@@ -281,8 +307,8 @@ jobs:
           set -euo pipefail
           gh release create "${{ steps.forkver.outputs.tag }}" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "codeg ${{ steps.forkver.outputs.forkver }} + floating-ball (fork)" \
-            --notes "基于上游 ${{ steps.upstream.outputs.tag }}，含悬浮球功能与 fork 更新源补丁。打包 linux-x64 与 linux-arm64。fork 构建号 ${{ steps.forkver.outputs.forkver }}（is_newer 可见，覆盖安装不再被同版本拒绝）。
+            --title "codeg ${{ steps.forkver.outputs.forkver }} + zcode-pin (fork)" \
+            --notes "基于上游 ${{ steps.upstream.outputs.tag }}，含 ZCode 0.72.0 补丁与 fork 更新源。打包 linux-x64 与 linux-arm64。fork 构建号 ${{ steps.forkver.outputs.forkver }}（is_newer 可见，覆盖安装不再被同版本拒绝）。
 
           $(cat /tmp/upstream-notes.md)" \
             "dist/${ARTIFACT}.tar.gz" \
@@ -300,7 +326,7 @@ jobs:
   # 与架构无关，直接复用 x64 包里的那份，避免在容器里再装一套 Node/pnpm。
   build-arm64:
     needs: sync-and-release
-    if: ${{ !cancelled() && (needs.sync-and-release.result == 'success' || needs.sync-and-release.result == 'skipped') }}
+    if: ${{ !cancelled() && (needs.sync-and-release.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.arm_only == true)) }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 150
     container: arm64v8/debian:12
