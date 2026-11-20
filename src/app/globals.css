@@ -1013,12 +1013,11 @@
     var(--muted-foreground) 88%,
     var(--foreground)
   );
-  /* 步骤行里的次要文字（描述、命令行、路径、摘要、右侧的数字）：比行首同色加粗的
-     标签（命令 / 思考 / 编辑……）再淡一档，和标签、和正文（文本步骤）都拉开。淡在
-     透明度上，叠在背景图上也是淡一档。亮色约 3.5:1（标签 4.7:1），暗色约 5.6:1。 */
+  /* 非文本步骤的标签、描述、命令行、路径和数字：保留半透明的次要层级，
+     比原先的 85% 略清楚；标签用字重区分，避免抢过正文。 */
   --activity-secondary: color-mix(
     in oklab,
-    var(--muted-foreground) 85%,
+    var(--muted-foreground) 90%,
     transparent
   );
   /* 「执行过程」头部胶囊的底：同用户消息气泡（bg-secondary），彩色预设下跟气泡一样带
@@ -1254,6 +1253,33 @@
     var(--chat-content-width, 48rem),
     100% - 2 * var(--chat-gutter, 0px)
   );
+}
+
+/* Where machine text (a path, a package, an address — see `MachineText`) may
+   break between lines, and where the browser may not break it by itself: an
+   empty mark between two characters, whose generated zero-width space allows
+   a break and whose word joiner forbids one. Generated text is not copied,
+   and its empty alternative text (after the "/") keeps it out of what is read
+   out, of a link's name and of find-in-page.
+
+   That syntax is the only declaration, with no fallback: an engine without
+   it drops the rule and generates nothing, rather than slip a character into
+   names. Chrome 77+ (Windows' WebView2, browsers) has it; so does WebKit from
+   Safari 17.4 — the macOS webview is the system WebKit, which Safari updates:
+   macOS 14.4+, and macOS 12–13 with Safari 17.4+ installed. Codeg declares
+   macOS 10.13 as its minimum (Tauri's default; the config sets none), so on
+   10.13–11, or 12–13 without that update, the marks are inert and machine
+   text simply breaks where its line runs out (`overflow-wrap: anywhere`,
+   which `MachineText` always sets). */
+@utility wrap-point {
+  &::after {
+    content: "\200B" / "";
+  }
+}
+@utility wrap-hold {
+  &::after {
+    content: "\2060" / "";
+  }
 }
 
 @layer base {
@@ -2237,6 +2263,13 @@
   top: 1.125rem;
 }
 
+/* A stretch of a long list's rows that is not drawn (`use-timeline-window.ts`):
+   no ring of its own, so its segment runs on from the one above — which stops
+   0.125rem into it, as it would into a row — to the row below. */
+.activity-item[data-marker="spacer"]::before {
+  top: 0.125rem;
+}
+
 /* The last row: a segment only beside a body under its line — an open panel,
    prose, a card (`data-body`); a folded row ends the rail at its ring. The
    segment ends a little further above the row's bottom edge than a one-line
@@ -2339,6 +2372,19 @@
 
 .activity-child[data-marker="dot"]::before {
   top: 1.1875rem;
+  bottom: calc(-1 * (var(--activity-gap) + 0.5625rem));
+}
+
+/* A stretch of a long run of members not drawn (`use-timeline-window.ts`):
+   its dashed segment runs on from the one above to the member below, as a
+   ring member's would — or, among dot members (`data-dots`), as theirs. */
+.activity-child[data-marker="spacer"]::before {
+  top: 0.25rem;
+  bottom: calc(-1 * (var(--activity-gap) + 0.25rem));
+}
+
+.activity-child[data-marker="spacer"][data-dots]::before {
+  top: 0.5625rem;
   bottom: calc(-1 * (var(--activity-gap) + 0.5625rem));
 }
 
@@ -2472,6 +2518,41 @@
 :lang(ko) .activity-mono,
 :lang(ar) .activity-mono {
   font-family: var(--font-sans);
+}
+
+/* A row that opens (the header button of `ActivityRow`, of a delegation
+   check, of a codeg tool or question record laid out as a row, of a goal),
+   pointed at or
+   focused: its grey words — label, description, command, path, figure, the
+   chevron — and the grey glyph in its ring (`RailIcon`'s `data-quiet`) darken
+   to the foreground, as the fold row at the foot of a list does
+   (`TimelineFoot`). What has a colour of its own keeps it: a tone (a diff's
+   counts, a failure, an amber wait), the shimmer of a running label, a name
+   already in the foreground, an agent's logo; the ring itself stays, as the
+   foot's does.
+   The ring is the row's marker (`.activity-marker`), beside the header and
+   not in it, so it is found from the row: the nearest row holding the button
+   — not a row whose panel holds a nested row that does. The timeline marks
+   that row as the button is pointed at or focused (`use-row-pointing.ts`):
+   found with `:has()` instead, every row that joined a list — a group's
+   member, a step under a goal — restyled the whole row around it, all its
+   members with it, on each step. Hover only where there is a pointer that
+   hovers, as Tailwind's `hover:` does, so a tap does not leave the row lit. */
+@media (hover: hover) {
+  .activity-row-toggle:hover
+    :is(.text-activity-secondary, .text-muted-foreground),
+  :is(.activity-item, .activity-child)[data-row-pointed]
+    > .activity-marker
+    [data-quiet] {
+    color: var(--foreground);
+  }
+}
+.activity-row-toggle:focus-visible
+  :is(.text-activity-secondary, .text-muted-foreground),
+:is(.activity-item, .activity-child)[data-row-focused]
+  > .activity-marker
+  [data-quiet] {
+  color: var(--foreground);
 }
 
 /* A row's figure (`RowFigure`) takes the line's room past the label and runs a

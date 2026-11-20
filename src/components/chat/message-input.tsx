@@ -1,6 +1,14 @@
 "use client"
 
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
 import { useTranslations } from "next-intl"
 import { isImeCompositionKey } from "@/lib/ime-composition"
 import { Button } from "@/components/ui/button"
@@ -11,6 +19,7 @@ import {
   ClipboardPaste,
   Clock,
   Copy,
+  Lightbulb,
   MessageSquareText,
   Scissors,
   Send,
@@ -380,9 +389,12 @@ export function MessageInput({
   const tAttach = useTranslations("Folder.chat.messageInput")
   // Skills read from disk feed the menu only for an agent that does not
   // advertise them itself: Codex under `$` (its native command set is very
-  // small), Antigravity under `/` beside its commands (its ACP server lists
-  // only its built-ins). Every other agent surfaces its skills through ACP
-  // `availableCommands`, so a disk scan would only repeat them — skip it.
+  // small), Antigravity and OpenCode under `/` beside their commands (their
+  // ACP servers list only commands, never a skill), and custom agents under `/`
+  // from the skill directories their user declared (codeg cannot know what an
+  // arbitrary ACP server advertises). Every other built-in agent surfaces its
+  // skills through ACP `availableCommands`, so a disk scan would only repeat
+  // them — skip it.
   const skillTrigger = diskSkillTrigger(agentType)
   // Pass the working dir so we see both global skills and folder-scoped
   // project skills (e.g. `{folder}/.codex/skills`). Without this, users
@@ -538,6 +550,7 @@ export function MessageInput({
   useEffect(() => {
     // navigator.clipboard is undefined at runtime in non-secure contexts even
     // though the DOM types claim it is always present, so guard with typeof.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- browser-only read after mount keeps static-export hydration consistent
     setClipboardReadSupported(
       typeof navigator !== "undefined" &&
         typeof navigator.clipboard?.readText === "function"
@@ -1044,15 +1057,14 @@ export function MessageInput({
   // types and the filter narrows, the previously-highlighted index can point
   // past the end of the merged list (commands + experts), which would make
   // Enter/Tab a silent no-op. Clamp back to the last available row whenever
-  // the count changes.
-  useEffect(() => {
-    if (
-      slashAutocompleteCount > 0 &&
-      slashSelectedIndex >= slashAutocompleteCount
-    ) {
-      setSlashSelectedIndex(slashAutocompleteCount - 1)
-    }
-  }, [slashAutocompleteCount, slashSelectedIndex])
+  // the count changes. Adjusted during render so no frame (and no key handler)
+  // ever sees the out-of-range index.
+  if (
+    slashAutocompleteCount > 0 &&
+    slashSelectedIndex >= slashAutocompleteCount
+  ) {
+    setSlashSelectedIndex(slashAutocompleteCount - 1)
+  }
 
   // Keep the highlighted row visible inside the popup when keyboard navigation
   // pushes it past the scroll viewport. Without this the cursor silently runs
@@ -1081,8 +1093,8 @@ export function MessageInput({
     }
   }, [slashMenuOpen, slashSelectedIndex, slashAutocompleteCount])
 
-  // ── Editor-driven `/` (commands, plus Antigravity's skills) and `$` (Codex
-  // skills) trigger detection ──
+  // ── Editor-driven `/` (commands, plus Antigravity's and OpenCode's skills)
+  // and `$` (Codex skills) trigger detection ──
   // The `@` mention panel is now owned by RichComposer; this only handles the
   // runtime-command menus. We inspect the text before the collapsed caret in the
   // current block: a `/` (any agent) or `$` (Codex) at the start or right after
@@ -1113,11 +1125,11 @@ export function MessageInput({
     // command list, which exists only once the connection is up — so an empty
     // list means "nothing to show" unless the connection is still coming, where
     // the panel opens on a loading row instead. A trigger that also lists disk
-    // skills (Codex's `$`, Antigravity's `/`) is deliberately ungated:
-    // `useAgentSkills` reports an in-flight scan as an empty list, so closing on
-    // empty would strand a trigger typed before the scan lands. Left open, the
-    // panel simply stays hidden until the skills arrive and then fills itself
-    // in — no second keystroke needed.
+    // skills (Codex's `$`, Antigravity's and OpenCode's `/`) is deliberately
+    // ungated: `useAgentSkills` reports an in-flight scan as an empty list, so
+    // closing on empty would strand a trigger typed before the scan lands. Left
+    // open, the panel simply stays hidden until the skills arrive and then fills
+    // itself in — no second keystroke needed.
     if (
       trigger === "/" &&
       skillTrigger !== "/" &&
@@ -1617,10 +1629,14 @@ export function MessageInput({
     buildDraft,
     draftStorageKey: effectiveDraftStorageKey,
   })
-  currentComposerRef.current = {
-    buildDraft,
-    draftStorageKey: effectiveDraftStorageKey,
-  }
+  // Only read after an await in the steer handler, so syncing it after commit
+  // is early enough.
+  useLayoutEffect(() => {
+    currentComposerRef.current = {
+      buildDraft,
+      draftStorageKey: effectiveDraftStorageKey,
+    }
+  })
 
   const handleSend = useCallback(() => {
     // The editor stays editable while `disabled` (the agent is busy) so the user
@@ -1881,6 +1897,13 @@ export function MessageInput({
     [handleModeSelect, onConfigOptionChange]
   )
 
+  const handleUsePromptSuggestion = useCallback(() => {
+    const ed = editorRef.current
+    if (!ed || !offeredSuggestion) return
+    ed.setText(offeredSuggestion)
+    ed.focus()
+  }, [offeredSuggestion])
+
   const actionButtons = isEditingQueueItem ? (
     <div className="flex items-center gap-1">
       <Button
@@ -1976,15 +1999,33 @@ export function MessageInput({
       </Button>
     )
   ) : (
-    <Button
-      onClick={handleSend}
-      disabled={disabled || !hasSendableContent}
-      size="icon"
-      className="h-8 w-8"
-      title={t("send")}
-    >
-      <Send className="size-4" />
-    </Button>
+    <div className="flex items-center gap-1">
+      {/* The click twin of Tab for a keyboard without one (a phone reaching
+          the web build): fills the predicted follow-up prompt into the empty
+          composer, sending nothing. Gone as soon as the composer holds text,
+          the same moment the placeholder hint goes. */}
+      {offeredSuggestion && composerEmpty && (
+        <Button
+          onClick={handleUsePromptSuggestion}
+          variant="ghost"
+          size="icon"
+          className="h-8 w-8"
+          title={t("usePromptSuggestion")}
+          aria-label={t("usePromptSuggestion")}
+        >
+          <Lightbulb className="size-4" />
+        </Button>
+      )}
+      <Button
+        onClick={handleSend}
+        disabled={disabled || !hasSendableContent}
+        size="icon"
+        className="h-8 w-8"
+        title={t("send")}
+      >
+        <Send className="size-4" />
+      </Button>
+    </div>
   )
 
   return (

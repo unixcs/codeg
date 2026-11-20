@@ -28,14 +28,17 @@ import {
   GitCommitHorizontal,
   GitMerge,
   GitPullRequestArrow,
+  Hand,
   Inbox,
   ListX,
   Loader2,
+  MessageSquareReply,
   MessageSquareText,
   Pencil,
   Play,
   RotateCw,
   ListTodo,
+  TimerOff,
   Trash2,
   Undo2,
 } from "lucide-react"
@@ -53,6 +56,7 @@ import {
   workTaskRetry,
   workTaskReturn,
   workTaskStart,
+  workTaskStopBackgroundWait,
 } from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
 import {
@@ -107,6 +111,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { BrowserLink } from "@/components/ui/browser-link"
+import { sourceItems } from "@/lib/forge-source-items"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
 import {
@@ -290,6 +295,7 @@ export function TaskDetailSheet({
   const [convAgentType, setConvAgentType] = useState<AgentType | null>(null)
   useEffect(() => {
     if (!open || conversationId == null) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- clears the chip owned by the transcript fetch below
       setTokenTotal(null)
       setConvAgentType(null)
       return
@@ -339,6 +345,7 @@ export function TaskDetailSheet({
   useEffect(() => {
     if (!open || taskId == null) return
 
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- per-open reset paired with the fetch + subscription below
     setEvents([])
     setFiles([])
     setComposerOpen(false)
@@ -382,9 +389,19 @@ export function TaskDetailSheet({
   // anyway" and waive a guard the user never saw refuse anything. (The label
   // and the waiver read the same state, so the two can never disagree; this is
   // about not carrying a decision across the moment it was made.)
-  useEffect(() => {
+  // Adjusted during render rather than in an effect, so no commit ever pairs a
+  // stale refusal with the new box/status; the initial null covers mount.
+  const [dupScope, setDupScope] = useState({
+    composerOpen,
+    status: taskStatus,
+  })
+  if (
+    dupScope.composerOpen !== composerOpen ||
+    dupScope.status !== taskStatus
+  ) {
+    setDupScope({ composerOpen, status: taskStatus })
     setRestartDuplicate(null)
-  }, [composerOpen, task?.status])
+  }
 
   /// A restart that consumed the note closes the box with it, so the text
   /// cannot be silently attached to a second restart the user did not mean.
@@ -458,6 +475,10 @@ export function TaskDetailSheet({
   const mergeRequests = usesMergeRequests(task, folderRemote?.provider)
 
   const canEdit = task.status === "todo" || task.status === "failed"
+  /** The reply drafted for each thread, item order by number. */
+  const threadReplies = Object.entries(task.writeback_drafts ?? {})
+    .filter(([, text]) => text.trim().length > 0)
+    .sort(([a], [b]) => Number(a) - Number(b))
 
   // The next-step panel's buttons — ONE list for every status, review
   // included, so the panel never changes shape from one status to the next.
@@ -466,6 +487,13 @@ export function TaskDetailSheet({
   // anything, so they sit in the bottom bar instead.
   const zoneActions: ZoneAction[] = []
   const isReview = task.status === "review" && !archived
+  /** The agent is parked on a prompt only the user can answer — in the
+   *  session viewer, so only once there is a session (always, in practice:
+   *  the engine enters this status from `running`, which binds one). */
+  const awaitingInput =
+    task.status === "awaiting_input" &&
+    !archived &&
+    task.conversation_id != null
   /** Accepted already, waiting for the project's one merge slot. */
   const mergeQueued = isReview && isMergeQueued(task)
   /** Put aside to handle later ("以后处理") — it waits under Done. */
@@ -628,6 +656,25 @@ export function TaskDetailSheet({
         case "preparing":
         case "running":
         case "awaiting_input":
+          // The card's swap (see `buildTaskActions`): answering leads, and it
+          // opens this sheet's own session viewer, stacked over it, where the
+          // pending prompt is pinned. Cancel holds the right edge as the
+          // escape hatch, the way "abandon" does for a reviewed task.
+          if (awaitingInput) {
+            zoneActions.push({
+              icon: MessageSquareReply,
+              label: t("actionRespond"),
+              filled: true,
+              onClick: () => setSessionOpen(true),
+            })
+            zoneActions.push({
+              icon: Ban,
+              label: t("actionCancelTask"),
+              trailing: true,
+              onClick: () => onCancel(task),
+            })
+            break
+          }
           zoneActions.push({
             icon: Ban,
             label: t("actionCancel"),
@@ -665,6 +712,15 @@ export function TaskDetailSheet({
           })
           zoneActions.push(archive(t("actionArchive")))
           break
+      }
+      // A turn held open for its background work — the card's same escape
+      // (see `buildTaskActions`): settle now, ending what still runs.
+      if (task.background_wait) {
+        zoneActions.push({
+          icon: TimerOff,
+          label: t("actionStopBackgroundWait"),
+          onClick: () => run(() => workTaskStopBackgroundWait(task.id)),
+        })
       }
     }
   }
@@ -902,6 +958,46 @@ export function TaskDetailSheet({
                 </section>
               ) : null}
 
+              {/* The reply drafted for the thread(s) the task came from,
+                  rendered the way the forge will render it. Read-only here:
+                  the acceptance dialogs are where it is edited, because
+                  accepting is what posts it. */}
+              {threadReplies.length > 0 ? (
+                <section className="flex flex-col gap-1.5">
+                  <h3 className="text-[0.6875rem] font-medium uppercase tracking-wide text-muted-foreground">
+                    {t("detailThreadReply")}
+                  </h3>
+                  {isReview ? (
+                    <p className="text-xs text-muted-foreground">
+                      {task.source_meta?.writeback === true
+                        ? t("detailThreadReplyHint")
+                        : t("detailThreadReplyOffHint")}
+                    </p>
+                  ) : null}
+                  {threadReplies.map(([number, text]) => (
+                    <CollapsibleBlock
+                      key={number}
+                      maxPx={192}
+                      fadeClass="from-muted"
+                    >
+                      <div
+                        className={cn(
+                          "break-words rounded-xl bg-muted p-3 text-xs leading-relaxed",
+                          RESULT_MARKDOWN
+                        )}
+                      >
+                        {threadReplies.length > 1 ? (
+                          <p className="mb-1.5 font-mono text-muted-foreground">
+                            #{number}
+                          </p>
+                        ) : null}
+                        <MessageResponse>{text}</MessageResponse>
+                      </div>
+                    </CollapsibleBlock>
+                  ))}
+                </section>
+              ) : null}
+
               {/* Next-step panel — one shell for EVERY status, below the
                   result and above the details. Amber while the task waits on
                   the user's acceptance, neutral otherwise: the tone changes,
@@ -913,12 +1009,28 @@ export function TaskDetailSheet({
                   className={cn(
                     "flex flex-col gap-3 rounded-xl border p-3",
                     // A deferred review is not waiting on the user right now —
-                    // they said so — so it drops the amber with its column.
-                    isReview && !deferred
+                    // they said so — so it drops the amber with its column. A
+                    // task awaiting input is waiting on them in the most
+                    // literal sense: its agent is stopped until they answer.
+                    (isReview && !deferred) || awaitingInput
                       ? "border-amber-500/30 bg-amber-500/5 dark:border-amber-400/25"
                       : "border-border/70 bg-muted/30"
                   )}
                 >
+                  {/* What the agent is waiting for and where to answer it — a
+                      first-time user sees a paused task and no reply box, and
+                      would otherwise reach for the only verb they recognize. */}
+                  {awaitingInput ? (
+                    <p className="flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-400">
+                      <Hand
+                        className="mt-px size-3.5 shrink-0"
+                        aria-hidden="true"
+                      />
+                      <span className="min-w-0 break-words">
+                        {t("awaitingInputHint")}
+                      </span>
+                    </p>
+                  ) : null}
                   {/* Why there is no merge button here: the task is in line
                       behind another landing of the same project. Without this
                       the panel would read as if the acceptance never
@@ -1151,6 +1263,29 @@ export function TaskDetailSheet({
                     unbroken across the box. nth-last-child(-n+2) is the dt/dd
                     of the final row, which drops its rule. */}
                 <dl className="grid grid-cols-[auto_1fr] overflow-hidden rounded-xl border border-border text-xs [&>*:nth-last-child(-n+2)]:border-b-0">
+                  {/* Where the task came from: its issue or change — every
+                      one of them, for a task made from several issues — each
+                      a way out to the forge. */}
+                  {task.source_meta ? (
+                    <InfoRow label={t("detailSource")}>
+                      <ul className="flex min-w-0 flex-col gap-0.5">
+                        {sourceItems(task.source_meta).map((item) => (
+                          <li key={item.number} className="min-w-0">
+                            <BrowserLink
+                              href={item.url}
+                              className="inline-flex max-w-full items-baseline gap-1.5 underline-offset-2 hover:underline"
+                              title={item.url}
+                            >
+                              <span className="shrink-0 font-mono text-[0.6875rem] text-muted-foreground">
+                                #{item.number}
+                              </span>
+                              <span className="truncate">{item.title}</span>
+                            </BrowserLink>
+                          </li>
+                        ))}
+                      </ul>
+                    </InfoRow>
+                  ) : null}
                   {task.work_branch ? (
                     <InfoRow label={t("detailBranch")}>
                       <span className="inline-flex min-w-0 max-w-full items-center gap-1 font-mono text-[0.6875rem]">
@@ -1754,6 +1889,8 @@ const EVENT_KIND_KEYS = {
   cleanup_failed: "eventCleanupFailed",
   resume_fallback: "eventResumeFallback",
   context_compact: "eventContextCompact",
+  background_wait: "eventBackgroundWait",
+  background_wait_end: "eventBackgroundWaitEnd",
   user_action: "eventUserAction",
   diff_stat: "eventDiffStat",
   forge_writeback: "eventForgeWriteback",
@@ -1954,6 +2091,29 @@ function timelineDetail(event: WorkTaskEvent): string | null {
         before && after ? `${before} → ${after}` : (before ?? str("reason"))
       return (
         [status, span, str("detail"), str("error")]
+          .filter(Boolean)
+          .join(" · ") || null
+      )
+    }
+    case "background_wait": {
+      const tasks = Array.isArray(p.tasks)
+        ? (p.tasks as unknown[]).filter((x) => typeof x === "string")
+        : []
+      return tasks.join(", ") || str("reason")
+    }
+    case "background_wait_end": {
+      const secs = typeof p.waited_secs === "number" ? p.waited_secs : null
+      const waited =
+        secs == null
+          ? null
+          : secs >= 60
+            ? `${Math.floor(secs / 60)}m ${secs % 60}s`
+            : `${secs}s`
+      const leftover = Array.isArray(p.leftover)
+        ? (p.leftover as unknown[]).filter((x) => typeof x === "string")
+        : []
+      return (
+        [str("outcome"), waited, leftover.join(", ") || null]
           .filter(Boolean)
           .join(" · ") || null
       )

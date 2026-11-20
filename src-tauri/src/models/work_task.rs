@@ -86,6 +86,11 @@ pub struct WorkTaskInfo {
     /// forge-sourced task — that one's pull request is `source_meta.result_pr`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery: Option<serde_json::Value>,
+    /// The reply drafted for each thread of a forge-sourced task, keyed by
+    /// item number — what the write-back posts once the task is accepted.
+    /// `None` = no draft (the comment is then the outcome line alone).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub writeback_drafts: Option<std::collections::BTreeMap<i64, String>>,
     /// Latest `agent_progress` milestone OF THIS GENERATION (filled by `list`
     /// for live tasks only — the card's realtime progress line). Scoped by
     /// `run_seq`: a retry, a follow-up and a merge each start a new one, and
@@ -98,11 +103,32 @@ pub struct WorkTaskInfo {
     /// explains a card sitting in `preparing`/`merging` for minutes.
     #[serde(default)]
     pub compacting: bool,
+    /// This generation's turn has ended, but the agent still has background
+    /// work going (a background shell, a monitor, the turn Claude Code starts
+    /// on its own to read their results, a delegation), so the engine is
+    /// holding the run open instead of settling it — settling would end the
+    /// connection, and the work with it. Filled by `list` alongside
+    /// `latest_progress`, from the generation's open `background_wait` event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_wait: Option<WorkTaskBackgroundWait>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub settled_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// What a run held open past its turn's end is waiting for (see
+/// [`WorkTaskInfo::background_wait`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkTaskBackgroundWait {
+    /// When the turn ended and the wait began.
+    pub since: DateTime<Utc>,
+    /// The work still running at that moment, one short description each (a
+    /// snapshot — the card names what the agent left running, not a live
+    /// list).
+    #[serde(default)]
+    pub tasks: Vec<String>,
 }
 
 /// One timeline entry of a task (append-only; see `work_task_event`).
@@ -137,10 +163,24 @@ pub struct WorkTaskDraft {
 pub struct WorkTaskSource {
     /// 'forge_issue' | 'forge_pr'
     pub kind: String,
-    /// Canonical key from `forge::source_key` — recomputed server-side.
+    /// Canonical key from `forge::source_key` — recomputed server-side. The
+    /// task's lead item: its only one, unless `extra_keys` names more.
     pub key: String,
+    /// The other items a task made from several related issues handles, in
+    /// the task's own order after the lead. Empty for a task triggered from
+    /// one item. Same derivation as `key`.
+    #[serde(default)]
+    pub extra_keys: Vec<String>,
     /// `ForgeSourceMeta` as JSON (URL, title, account id, PR head/base …).
     pub meta: serde_json::Value,
+}
+
+impl WorkTaskSource {
+    /// Every item the task handles, lead first — what its
+    /// `work_task_source_key` rows record.
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        std::iter::once(&self.key).chain(self.extra_keys.iter())
+    }
 }
 
 /// Wire DTO for a saved task template: a display name plus the title seed and
@@ -519,6 +559,15 @@ pub struct WorkTaskChangedFile {
     pub file: String,
     pub additions: i32,
     pub deletions: i32,
+}
+
+/// A file a task worktree holds uncommitted (`git status`): what committing
+/// the leftovers before a delivery would add. `status` is one letter — `A`
+/// added or untracked, `M` modified, `D` deleted, `R` renamed or copied.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkTaskUncommittedFile {
+    pub file: String,
+    pub status: String,
 }
 
 #[cfg(test)]
