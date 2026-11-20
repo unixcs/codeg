@@ -126,30 +126,39 @@ jobs:
           git config user.email "bot@users.noreply.github.com"
           git remote add upstream https://github.com/spacering-net/codeg.git
           git fetch upstream "${{ steps.upstream.outputs.tag }}"
+          head_before=$(git rev-parse HEAD)
           if git merge --no-ff --no-edit FETCH_HEAD; then
             echo "merged=true" >> "$GITHUB_OUTPUT"
-            git log --oneline -1
+            if [ "$(git rev-parse HEAD)" = "$head_before" ]; then
+              # "Already up to date": the deploy tip is already a merge of this
+              # same tag (e.g. the merge was done locally and force-pushed).
+              # No commit was created, so there is nothing to push back —
+              # amending here would rewrite that existing merge into a
+              # non-fast-forward rejection. The checked-out tree is still the
+              # fully merged one, so only "created" flips, not "merged":
+              # every build step below gates on merged and must still run.
+              echo "created=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "created=true" >> "$GITHUB_OUTPUT"
+              git log --oneline -1
+            fi
           else
             git merge --abort || true
             echo "merged=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Push the clean merge back to deploy branch
-        if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true'
+        if: steps.skip.outputs.already == 'false' && steps.merge.outputs.merged == 'true' && steps.merge.outputs.created == 'true'
         run: |
           set -euo pipefail
           # Keep the fork's own workflows: upstream's .github changes would
           # otherwise require a `workflow`-scoped token. Restore the pre-merge
           # copy and amend the merge commit so the pushed tree never carries
           # upstream workflows.
-          # A forced rebuild merges an upstream tag that is already an ancestor:
-          # Git says "Already up to date" and creates no merge commit. There is
-          # nothing to push back (and amending HEAD would rewrite our own commit
-          # into a non-fast-forward). Only push when HEAD is a real merge.
-          if [ "$(git rev-list --parents -n1 HEAD | wc -w)" -lt 3 ]; then
-            echo "No merge commit (upstream already an ancestor) — skip push-back."
-            exit 0
-          fi
+          # Only reachable when this run actually created a merge commit
+          # (created == 'true') — when upstream was already an ancestor the
+          # merge step sets created=false and this step is skipped entirely
+          # (amending a pre-existing merge would be a non-fast-forward push).
           git checkout HEAD^1 -- .github/workflows
           git add .github/workflows
           git commit --amend --no-edit
